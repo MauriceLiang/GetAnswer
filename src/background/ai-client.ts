@@ -1,12 +1,60 @@
-import type { AIAnswer, AIConfig, ChoiceOption, Question } from '../shared/types';
+import type {
+  AIAnswer,
+  AIConfig,
+  ChoiceOption,
+  ProjectAnswer,
+  ProjectAnswerFile,
+  Question
+} from '../shared/types';
 import { appError, AppErrorException } from '../shared/errors';
+import {
+  isPythonProjectPath,
+  normalizeProjectPath,
+  preservesOriginalCode
+} from '../shared/project-files';
 import { validateConfig } from './config';
 
 export type FetchImplementation = typeof fetch;
 
 const ANSWER_MAX_TOKENS = 4096;
 
+function maxAnswerTokens(question: Question): number {
+  if (question.type !== 'project') return ANSWER_MAX_TOKENS;
+  const sourceCharacters = (question.files ?? [])
+    .filter((file) => file.editable && isPythonProjectPath(file.path))
+    .reduce((total, file) => total + file.code.length, 0);
+  return Math.max(ANSWER_MAX_TOKENS, Math.ceil(sourceCharacters / 3) + 2048);
+}
+
 export function buildPrompt(question: Question): string {
+  if (question.type === 'project') {
+    const files = question.files ?? [];
+    const editableFiles = files.filter((file) => (
+      file.editable && isPythonProjectPath(file.path)
+    ));
+    const answerExample = JSON.stringify({
+      files: editableFiles.map((file) => ({ path: file.path, code: '新增后的完整代码' }))
+    });
+    const fileContext = files.map((file) => [
+      `文件：${file.path}`,
+      `权限：${file.editable ? '可修改（仅允许新增 Python 代码）' : '只读（禁止修改）'}`,
+      `原始内容：\n${file.code || '(空文件)'}`
+    ].join('\n')).join('\n\n') || '无';
+
+    return [
+      '你是在线课程多文件 Python 项目求解器。',
+      '必须阅读下面列出的每一个文件及其完整原始内容，再完成题目。',
+      '只能修改 Python 文件（扩展名为 .py），data.txt、json、csv 等非 Python 文件只能读取，禁止返回或修改它们。',
+      '每个 Python 文件的原有代码必须原样保留、顺序不变，只能新增代码；不得删除、替换、重排或改写任何原有行。',
+      `必须为每个可修改的 Python 文件返回一次完整代码，严格返回 JSON：${answerExample}`,
+      'path 必须使用下面给出的文件路径，code 必须是该文件写入后的完整内容，不要返回 Markdown、解释或其他文字。',
+      `题目标题：${question.title ?? ''}`,
+      `题目说明：\n${question.content}`,
+      `任务与要求（验收标准）：\n${question.requirements ?? '未提供'}`,
+      `项目文件（全部原文）：\n${fileContext}`
+    ].join('\n\n');
+  }
+
   if (question.type === 'choice') {
     const mode = question.selectionMode === 'multiple' ? '多选题' : '单选题或判断题';
     const options = question.options?.map((option) => `${option.key}. ${option.text}`).join('\n') || '无';
@@ -100,6 +148,11 @@ function stripCodeFence(content: string): string {
   const trimmed = content.trim();
   const match = trimmed.match(/^```[^\n]*\n([\s\S]*?)\n?```$/);
   return (match?.[1] ?? trimmed).trim();
+}
+
+function stripProjectCodeFence(content: string): string {
+  const match = content.match(/^```[^\r\n]*\r?\n([\s\S]*?)\r?\n?```\s*$/);
+  return match?.[1] ?? content;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -207,6 +260,78 @@ export function parseFillAnswer(content: string, question: Question): string[] {
     throw appError('AI_RESPONSE_INVALID', `AI 返回的填空答案数量无效，应为 ${expectedCount} 个`);
   }
   return values;
+}
+
+export function parseProjectAnswer(content: string, question: Question): ProjectAnswer {
+  if (question.type !== 'project') {
+    throw appError('AI_RESPONSE_INVALID', '当前题目不是多文件项目');
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stripCodeFence(content));
+  } catch {
+    throw appError('AI_RESPONSE_INVALID', 'AI 返回的多文件答案不是有效 JSON');
+  }
+
+  const rawFiles = isRecord(parsed) ? parsed.files : undefined;
+  if (!Array.isArray(rawFiles)) {
+    throw appError('AI_RESPONSE_INVALID', 'AI 返回的多文件答案缺少 files 数组');
+  }
+
+  const sourceFiles = question.files ?? [];
+  const editableFiles = sourceFiles.filter((file) => (
+    file.editable && isPythonProjectPath(file.path)
+  ));
+  const sourceByPath = new Map(
+    editableFiles.map((file) => [normalizeProjectPath(file.path), file])
+  );
+  if (rawFiles.length !== editableFiles.length) {
+    throw appError(
+      'AI_RESPONSE_INVALID',
+      `AI 返回的 Python 文件数量无效，应为 ${editableFiles.length} 个`
+    );
+  }
+
+  const seen = new Set<string>();
+  const files: ProjectAnswerFile[] = [];
+  for (const rawFile of rawFiles) {
+    if (!isRecord(rawFile)
+      || typeof rawFile.path !== 'string'
+      || typeof rawFile.code !== 'string') {
+      throw appError('AI_RESPONSE_INVALID', 'AI 返回了无效的项目文件结构');
+    }
+
+    const normalizedPath = normalizeProjectPath(rawFile.path);
+    const sourceFile = sourceByPath.get(normalizedPath);
+    if (!sourceFile) {
+      throw appError('AI_RESPONSE_INVALID', `AI 返回了不允许修改的文件：${rawFile.path}`);
+    }
+    if (seen.has(normalizedPath)) {
+      throw appError('AI_RESPONSE_INVALID', `AI 重复返回了文件：${sourceFile.path}`);
+    }
+
+    const code = stripProjectCodeFence(rawFile.code);
+    if (!code.trim()) {
+      throw appError('AI_RESPONSE_INVALID', `AI 返回的文件为空：${sourceFile.path}`);
+    }
+    if (!preservesOriginalCode(sourceFile.code, code)) {
+      throw appError(
+        'AI_RESPONSE_INVALID',
+        `AI 修改了 ${sourceFile.path} 的原有代码，已拒绝写入`
+      );
+    }
+
+    seen.add(normalizedPath);
+    files.push({ path: sourceFile.path, code });
+  }
+
+  const missingFile = editableFiles.find((file) => !seen.has(normalizeProjectPath(file.path)));
+  if (missingFile) {
+    throw appError('AI_RESPONSE_INVALID', `AI 未返回 Python 文件：${missingFile.path}`);
+  }
+
+  return { type: 'project', files };
 }
 
 interface CompletionMessage {
@@ -373,10 +498,14 @@ export async function askAI(
     config,
     [{ role: 'user', content: buildPrompt(question) }],
     fetchImpl,
-    ANSWER_MAX_TOKENS,
+    maxAnswerTokens(question),
     signal
   );
   const content = getFinalContent(responseText);
+
+  if (question.type === 'project') {
+    return parseProjectAnswer(content, question);
+  }
 
   if (question.type === 'choice') {
     return {

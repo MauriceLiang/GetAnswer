@@ -36,6 +36,7 @@ const question = computed(() => pageContext.value.question);
 const isSolving = computed(() => status.value === 'requesting' || status.value === 'filling');
 const canSolve = computed(() => pageContext.value.supported
   && (question.value?.type === 'programming'
+    || question.value?.type === 'project'
     || question.value?.type === 'choice'
     || question.value?.type === 'fill')
   && !isSolving.value);
@@ -73,6 +74,7 @@ function getQuestionKey(value: Question): string {
     examples: value.examples ?? [],
     language: value.language ?? '',
     editorCode: value.editorCode ?? '',
+    ...(value.type === 'project' ? { files: value.files ?? [] } : {}),
     blankCount: value.blankCount ?? 0,
     selectionMode: value.selectionMode ?? '',
     options: value.options ?? []
@@ -97,6 +99,9 @@ function isCurrentSolveActive(questionKey: string, generation: number): boolean 
 
 function formatAnswer(answer: AIAnswer): string {
   if (answer.type === 'programming') return answer.code;
+  if (answer.type === 'project') {
+    return answer.files.map((file) => `# ${file.path}\n${file.code}`).join('\n\n');
+  }
   if (answer.type === 'choice') return `选项：${answer.selections.join('、')}`;
   return `填空：${answer.values.join('；')}`;
 }
@@ -107,6 +112,17 @@ function getAnswerText(value: unknown): string {
   if (typeof answer !== 'object' || answer === null || !('type' in answer)) return '';
   if (answer.type === 'programming' && 'code' in answer && typeof answer.code === 'string') {
     return answer.code;
+  }
+  if (answer.type === 'project' && 'files' in answer && Array.isArray(answer.files)) {
+    const files = answer.files.filter((file): file is { path: string; code: string } => (
+      typeof file === 'object'
+      && file !== null
+      && 'path' in file
+      && typeof file.path === 'string'
+      && 'code' in file
+      && typeof file.code === 'string'
+    ));
+    return files.map((file) => `# ${file.path}\n${file.code}`).join('\n\n');
   }
   if (answer.type === 'choice' && 'selections' in answer && Array.isArray(answer.selections)) {
     const selections = answer.selections.filter((selection): selection is string => (
@@ -332,6 +348,7 @@ function maybeAutoSolve(context: PageContext): void {
   if ((!config.value.autoSolve && !autoAnswerRunning.value) || !context.question
     || autoAnswerStopped.value
     || (context.question.type !== 'programming'
+      && context.question.type !== 'project'
       && context.question.type !== 'choice'
       && context.question.type !== 'fill')) {
     return;
@@ -442,7 +459,9 @@ onBeforeUnmount(() => {
 
     <section class="question-card">
       <p>适配器：{{ pageContext.adapter }}</p>
-      <p>题型：{{ question?.type === 'choice'
+      <p>题型：{{ question?.type === 'project'
+        ? '综合项目'
+        : question?.type === 'choice'
         ? '选择题'
         : question?.type === 'fill'
           ? '填空题'
@@ -493,7 +512,7 @@ onBeforeUnmount(() => {
           <input v-model="config.autoSolve" name="auto-solve" type="checkbox" />
           识别题目后自动解答
         </label>
-        <p class="setting-hint">开启后，识别到编程题或选择题会自动调用 AI 并填写答案。</p>
+        <p class="setting-hint">开启后，识别到编程题、综合项目或选择题会自动调用 AI 并填写答案。</p>
         <label class="checkbox-label">
           <input v-model="config.autoAdvanceVideo" name="auto-advance-video" type="checkbox" />
           视频完成后自动进入下一项

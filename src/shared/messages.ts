@@ -4,9 +4,11 @@ import type {
   ChoiceOption,
   ExampleCase,
   PageContext,
+  ProjectFile,
   Question,
   TaskStatus
 } from './types';
+import { isPythonProjectPath } from './project-files';
 
 export type ExtensionMessage =
   | { type: 'GET_PAGE_CONTEXT' }
@@ -61,9 +63,18 @@ function isChoiceOption(value: unknown): value is ChoiceOption {
     && typeof value.text === 'string';
 }
 
+function isProjectFile(value: unknown): value is ProjectFile {
+  return isRecord(value)
+    && typeof value.path === 'string'
+    && value.path.trim().length > 0
+    && typeof value.code === 'string'
+    && typeof value.editable === 'boolean'
+    && value.editable === isPythonProjectPath(value.path);
+}
+
 function isQuestion(value: unknown): value is Question {
   if (!isRecord(value)) return false;
-  if (value.type !== 'programming' && value.type !== 'choice'
+  if (value.type !== 'programming' && value.type !== 'project' && value.type !== 'choice'
     && value.type !== 'fill' && value.type !== 'unknown') {
     return false;
   }
@@ -73,6 +84,10 @@ function isQuestion(value: unknown): value is Question {
   if (value.requirements !== undefined && typeof value.requirements !== 'string') return false;
   if (value.language !== undefined && typeof value.language !== 'string') return false;
   if (value.editorCode !== undefined && typeof value.editorCode !== 'string') return false;
+  if (value.files !== undefined
+    && (!Array.isArray(value.files) || !value.files.every(isProjectFile))) {
+    return false;
+  }
   if (value.selectionMode !== undefined
     && value.selectionMode !== 'single'
     && value.selectionMode !== 'multiple') {
@@ -93,6 +108,11 @@ function isQuestion(value: unknown): value is Question {
       && Array.isArray(value.options)
       && value.options.length > 0;
   }
+  if (value.type === 'project') {
+    return Array.isArray(value.files)
+      && value.files.length > 0
+      && value.files.some((file) => file.editable);
+  }
   if (value.type === 'fill') {
     return value.blankCount !== undefined
       && value.editorCode !== undefined
@@ -104,6 +124,15 @@ function isQuestion(value: unknown): value is Question {
 
 function isAIAnswer(value: unknown): value is AIAnswer {
   if (!isRecord(value)) return false;
+  if (value.type === 'project') {
+    return Array.isArray(value.files)
+      && value.files.length > 0
+      && value.files.every((file) => isRecord(file)
+        && typeof file.path === 'string'
+        && file.path.trim().length > 0
+        && typeof file.code === 'string'
+        && file.code.trim().length > 0);
+  }
   if (value.type === 'programming') {
     return typeof value.code === 'string' && value.code.trim().length > 0;
   }

@@ -1,3 +1,4 @@
+import { isExtensionMessage } from '../shared/messages';
 import type { ExtensionMessage } from '../shared/messages';
 import type {
   AIAnswer,
@@ -189,8 +190,18 @@ export function createMessageHandler(dependencies: MessageHandlerDependencies) {
     try {
       notifyCorrelated(dependencies, { type: 'STATUS', status: 'requesting' }, questionKey);
       const config = await dependencies.getConfig();
+      let question = message.question;
+      if (question.type === 'project') {
+        const rawContext = await dependencies.sendToTab(tabId, { type: 'GET_PAGE_CONTEXT' });
+        if (!isExtensionMessage(rawContext)
+          || rawContext.type !== 'PAGE_CONTEXT'
+          || rawContext.data.question?.type !== 'project') {
+          throw appError('QUESTION_NOT_FOUND', '无法读取项目中的全部文件');
+        }
+        question = rawContext.data.question;
+      }
       const answer = await dependencies.askAI(
-        message.question,
+        question,
         config,
         operation.controller.signal
       );

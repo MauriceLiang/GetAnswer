@@ -2,6 +2,12 @@ import { appError } from '../shared/errors';
 import type { AppErrorCode } from '../shared/types';
 
 const DEFAULT_BRIDGE_TIMEOUT = 2000;
+let requestSequence = 0;
+
+function nextRequestId(): string {
+  requestSequence += 1;
+  return `ai-editor-${Date.now()}-${requestSequence}`;
+}
 
 function isEditorErrorCode(value: unknown): value is Extract<
   AppErrorCode,
@@ -19,6 +25,7 @@ export function fillCodeInPage(
     return Promise.reject(appError('EDITOR_WRITE_FAILED', '代码为空，无法写入编辑器'));
   }
 
+  const requestId = nextRequestId();
   return new Promise<void>((resolve, reject) => {
     let timeout: ReturnType<typeof setTimeout> | undefined;
 
@@ -28,7 +35,9 @@ export function fillCodeInPage(
     };
 
     const onMessage = (event: MessageEvent) => {
-      if (event.source !== targetWindow || event.data?.type !== 'AI_FILL_CODE_RESULT') return;
+      if (event.source !== targetWindow
+        || event.data?.type !== 'AI_FILL_CODE_RESULT'
+        || event.data?.requestId !== requestId) return;
 
       cleanup();
       if (event.data.success === true) {
@@ -47,10 +56,53 @@ export function fillCodeInPage(
     };
 
     targetWindow.addEventListener('message', onMessage);
-    targetWindow.postMessage({ type: 'AI_FILL_CODE', code }, '*');
+    targetWindow.postMessage({ type: 'AI_FILL_CODE', code, requestId }, '*');
     timeout = setTimeout(() => {
       cleanup();
       reject(appError('EDITOR_WRITE_FAILED', '写入编辑器超时'));
+    }, timeoutMs);
+  });
+}
+
+export function readCodeInPage(
+  targetWindow: Window = window,
+  timeoutMs = DEFAULT_BRIDGE_TIMEOUT
+): Promise<string> {
+  const requestId = nextRequestId();
+  return new Promise<string>((resolve, reject) => {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+
+    const cleanup = () => {
+      targetWindow.removeEventListener('message', onMessage);
+      if (timeout !== undefined) clearTimeout(timeout);
+    };
+
+    const onMessage = (event: MessageEvent) => {
+      if (event.source !== targetWindow
+        || event.data?.type !== 'AI_READ_CODE_RESULT'
+        || event.data?.requestId !== requestId) return;
+
+      cleanup();
+      if (event.data.success === true && typeof event.data.code === 'string') {
+        resolve(event.data.code);
+        return;
+      }
+
+      const codeFromPage = event.data.error?.code;
+      const errorCode = isEditorErrorCode(codeFromPage)
+        ? codeFromPage
+        : 'EDITOR_WRITE_FAILED';
+      reject(appError(
+        errorCode,
+        event.data.error?.message ?? '读取编辑器失败'
+      ));
+    };
+
+    targetWindow.addEventListener('message', onMessage);
+    targetWindow.postMessage({ type: 'AI_READ_CODE', requestId }, '*');
+    timeout = setTimeout(() => {
+      cleanup();
+      reject(appError('EDITOR_WRITE_FAILED', '读取编辑器超时'));
     }, timeoutMs);
   });
 }

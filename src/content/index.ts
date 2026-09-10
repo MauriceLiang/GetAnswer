@@ -4,7 +4,7 @@ import { isExtensionMessage } from '../shared/messages';
 import type { ExtensionMessage } from '../shared/messages';
 import type { AppError } from '../shared/types';
 import { createDebouncedScanner, scanPage } from './scanner';
-import { fillCodeInPage } from './injected-bridge';
+import { fillCodeInPage, readCodeInPage } from './injected-bridge';
 
 function toAppError(
   error: unknown,
@@ -20,17 +20,27 @@ function toAppError(
   return fallback;
 }
 
-function injectPageContext(): void {
+function injectPageContext(): Promise<void> {
   const script = document.createElement('script');
   script.src = chrome.runtime.getURL('injected.js');
-  script.addEventListener('load', () => script.remove(), { once: true });
-  script.addEventListener('error', () => script.remove(), { once: true });
+  const ready = new Promise<void>((resolve) => {
+    const finish = (): void => {
+      script.remove();
+      resolve();
+    };
+    script.addEventListener('load', finish, { once: true });
+    script.addEventListener('error', finish, { once: true });
+  });
   (document.head ?? document.documentElement).appendChild(script);
+  return ready;
 }
 
+const pageContextReady = injectPageContext();
 const fillCode = (code: string) => fillCodeInPage(code, window);
+const readCode = () => readCodeInPage(window);
 let submissionWatcherStarted = false;
 let solveGeneration = 0;
+let projectContextCollecting = false;
 
 function ensureSubmissionWatcher(): void {
   if (submissionWatcherStarted) return;
@@ -45,15 +55,55 @@ const scan = () => {
   ensureSubmissionWatcher();
   return scanPage(document, window.location, fillCode);
 };
+
+function scanWithoutProjectFiles(): ReturnType<typeof scan> {
+  const context = scan();
+  if (context.question?.type !== 'project') return context;
+  const { question: _question, ...withoutQuestion } = context;
+  return { ...withoutQuestion, supported: false };
+}
+
+let projectContextPromise: Promise<ReturnType<typeof scan>> | undefined;
 const emitPageContext = (context: ReturnType<typeof scan>) => {
   void chrome.runtime.sendMessage({ type: 'PAGE_CONTEXT', data: context }).catch(() => undefined);
 };
 
-injectPageContext();
-emitPageContext(scan());
+function scanWithProjectFiles(): Promise<ReturnType<typeof scan>> {
+  if (projectContextPromise) return projectContextPromise;
 
-const scheduleScan = createDebouncedScanner(scan, emitPageContext, 300);
-const observer = new MutationObserver(scheduleScan);
+  const adapter = findAdapter(document, window.location, fillCode, readCode);
+  if (!adapter?.extractQuestionAsync || adapter.detectQuestionType() !== 'project') {
+    return Promise.resolve(scan());
+  }
+
+  projectContextCollecting = true;
+  projectContextPromise = pageContextReady
+    .then(() => adapter.extractQuestionAsync!())
+    .then((question) => {
+      const context = scan();
+      return question ? { ...context, question, supported: true } : context;
+    })
+    .finally(() => {
+      projectContextCollecting = false;
+      projectContextPromise = undefined;
+    });
+  return projectContextPromise;
+}
+
+async function scanForEmit(): Promise<ReturnType<typeof scan>> {
+  try {
+    return await scanWithProjectFiles();
+  } catch {
+    return scanWithoutProjectFiles();
+  }
+}
+
+void scanForEmit().then(emitPageContext);
+
+const scheduleScan = createDebouncedScanner(scanForEmit, emitPageContext, 300);
+const observer = new MutationObserver(() => {
+  if (!projectContextCollecting) scheduleScan();
+});
 observer.observe(document.body, { childList: true, subtree: true });
 window.addEventListener('popstate', scheduleScan);
 
@@ -61,8 +111,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (!isExtensionMessage(message)) return;
 
   if (message.type === 'GET_PAGE_CONTEXT') {
-    sendResponse({ type: 'PAGE_CONTEXT', data: scan() } satisfies ExtensionMessage);
-    return;
+    void scanWithProjectFiles()
+      .then((context) => sendResponse({ type: 'PAGE_CONTEXT', data: context } satisfies ExtensionMessage))
+      .catch(() => sendResponse({
+        type: 'PAGE_CONTEXT',
+        data: scanWithoutProjectFiles()
+      } satisfies ExtensionMessage));
+    return true;
   }
 
   if (message.type === 'STOP_SOLVING') {
@@ -94,7 +149,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (message.type !== 'FILL_ANSWER') return;
 
-  const adapter = findAdapter(document, window.location, fillCode);
+  const adapter = findAdapter(document, window.location, fillCode, readCode);
   if (!adapter) {
     sendResponse({
       type: 'FILL_RESULT',
@@ -106,6 +161,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   const currentSolveGeneration = solveGeneration;
   const isStopped = () => currentSolveGeneration !== solveGeneration;
+  const projectAnswerFilling = message.answer.type === 'project';
+  if (projectAnswerFilling) projectContextCollecting = true;
 
   void adapter.fillAnswer(message.answer)
     .then(async () => {
@@ -133,6 +190,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       type: 'FILL_RESULT',
       success: false,
       error: toAppError(error)
-    } satisfies ExtensionMessage));
+    } satisfies ExtensionMessage))
+    .finally(() => {
+      if (projectAnswerFilling) projectContextCollecting = false;
+    });
   return true;
 });

@@ -2,17 +2,25 @@ import type {
   AIAnswer,
   ChoiceOption,
   ExampleCase,
+  ProjectAnswer,
+  ProjectFile,
   Question,
   QuestionType
 } from '../shared/types';
 import { appError } from '../shared/errors';
-import type { CodeFiller, SiteAdapter } from './base';
+import {
+  isPythonProjectPath,
+  normalizeProjectPath,
+  preservesOriginalCode
+} from '../shared/project-files';
+import type { CodeFiller, CodeReader, SiteAdapter } from './base';
 
 const SUBMIT_RESULT_TIMEOUT_MS = 10_000;
 const VIDEO_METADATA_TIMEOUT_MS = 10_000;
 const VIDEO_SEEK_TIMEOUT_MS = 10_000;
 const NEXT_NAVIGATION_FALLBACK_MS = 300;
-const nextItemClicked = new WeakSet<Document>();
+const PROJECT_FILE_SWITCH_TIMEOUT_MS = 3_000;
+const nextItemClicked = new WeakMap<Document, symbol>();
 let submissionInFlight = false;
 
 const defaultFillCode: CodeFiller = async () => {
@@ -97,6 +105,14 @@ function findNextVideoControl(document: Document): HTMLElement | null {
   return nextLink ?? null;
 }
 
+function findHeaderNextControl(document: Document): HTMLButtonElement | null {
+  return Array.from(document.querySelectorAll<HTMLButtonElement>(
+    '.course-navigations-buttons button'
+  )).find((button) => button.querySelector('.fa-chevron-right') !== null
+    && !button.matches(':disabled, [aria-disabled="true"]')
+    && isVisible(button, document.defaultView)) ?? null;
+}
+
 function isVisible(element: Element, view: Window | null): boolean {
   let current: Element | null = element;
   while (current) {
@@ -122,7 +138,8 @@ function findNextItemButton(document: Document): HTMLButtonElement | null {
 
     const nextButton = Array.from(
       wrapper.querySelectorAll<HTMLButtonElement>('button')
-    ).find((button) => textOf(button).includes('下一项'));
+    ).find((button) => textOf(button).includes('下一项')
+      && !button.matches(':disabled, [aria-disabled="true"]'));
     if (nextButton && isVisible(nextButton, view)) return nextButton;
   }
 
@@ -140,23 +157,39 @@ function hasInlineSubmissionResult(document: Document): boolean {
     });
 }
 
+function hasProjectSubmissionResult(document: Document): boolean {
+  if (findSubmitButton(document)?.disabled) return false;
+  return Array.from(document.querySelectorAll('.project-exercise .project-judgment-result'))
+    .some((result) => {
+      const tasks = Array.from(result.querySelectorAll('.tasks-list .task'));
+      // Task descriptions and status icons exist before grading; only the task classes change.
+      return isVisible(result, document.defaultView)
+        && tasks.length > 0
+        && tasks.every((task) => task.classList.contains('task-status-ok'));
+    });
+}
+
 function hasSubmissionFailure(document: Document): boolean {
   const view = document.defaultView;
   const failurePattern = /作答错误|回答错误|答案错误|不正确|未通过/;
   return Array.from(document.querySelectorAll(
+    '.project-exercise .project-judgment-result .task-status-failed, '
+    + '.project-exercise .project-judgment-result .task-status-error'
+  )).some((task) => isVisible(task, view)) || Array.from(document.querySelectorAll(
     '.check-result-status, .el-dialog__body, [role="dialog"], .el-overlay-dialog'
   )).some((result) => isVisible(result, view) && failurePattern.test(textOf(result)));
 }
 
 const submissionResultSelector =
-  '.check-result-status, .el-dialog__body, [role="dialog"], .el-overlay-dialog';
+  '.check-result-status, .el-dialog__body, [role="dialog"], .el-overlay-dialog, '
+  + '.project-exercise .project-judgment-result';
 
 function isSubmissionResultNode(node: Node): boolean {
   const element = node.nodeType === Node.ELEMENT_NODE
     ? node as Element
     : node.parentElement;
-  return element?.matches(submissionResultSelector) === true
-    || element?.closest(submissionResultSelector) !== null;
+  return element !== null && (element.matches(submissionResultSelector)
+    || element.closest(submissionResultSelector) !== null);
 }
 
 type SubmissionOutcome =
@@ -217,9 +250,12 @@ function waitForSubmissionOutcome(document: Document): Promise<SubmissionOutcome
 }
 
 function findSubmissionNextControl(document: Document): HTMLElement | null {
+  if (hasSubmissionFailure(document)) return null;
   const dialogButton = findNextItemButton(document);
   if (dialogButton) return dialogButton;
-  return hasInlineSubmissionResult(document) ? findNextVideoControl(document) : null;
+  return hasInlineSubmissionResult(document) || hasProjectSubmissionResult(document)
+    ? findNextVideoControl(document) ?? findHeaderNextControl(document)
+    : null;
 }
 
 function extractEditorCode(document: Document): string | undefined {
@@ -235,6 +271,205 @@ function extractEditorCode(document: Document): string | undefined {
   const textarea = editor.querySelector('textarea') as HTMLTextAreaElement | null;
   const textareaValue = textarea?.value.trim() ?? '';
   return textareaValue || undefined;
+}
+
+interface ProjectFileEntry {
+  path: string;
+  key?: string;
+  trigger: HTMLElement;
+}
+
+interface ProjectFileSnapshot {
+  entries: ProjectFileEntry[];
+  files: ProjectFile[];
+  activePath?: string;
+}
+
+function directTreeContent(node: HTMLElement): HTMLElement | null {
+  return Array.from(node.children)
+    .find((child) => child.classList.contains('el-tree-node__content')) as HTMLElement | null;
+}
+
+function projectFilePath(node: HTMLElement, fileName: string): string {
+  const directories: string[] = [];
+  let parent = node.parentElement?.closest<HTMLElement>('[role="treeitem"]');
+  while (parent) {
+    const content = directTreeContent(parent);
+    const name = textOf(content?.querySelector('.filename') ?? null);
+    const hasFileIcon = content?.querySelector('.file-icon i')?.className.includes('fa-file') ?? false;
+    if (name && !hasFileIcon && !/^根目录$|^root$/i.test(name)) directories.unshift(name);
+    parent = parent.parentElement?.closest<HTMLElement>('[role="treeitem"]');
+  }
+  return [...directories, fileName].join('/');
+}
+
+function projectFileEntries(document: Document): ProjectFileEntry[] {
+  return Array.from(document.querySelectorAll<HTMLElement>(
+    '.project-exercise .tree-file-explorer [role="treeitem"]'
+  )).flatMap((node) => {
+    const content = directTreeContent(node);
+    const fileName = textOf(content?.querySelector('.filename') ?? null);
+    const iconClass = content?.querySelector('.file-icon i')?.className ?? '';
+    const hasChildren = Array.from(node.children)
+      .some((child) => child.classList.contains('el-tree-node__children'));
+    if (!content || !fileName || hasChildren || iconClass.includes('fa-folder')) return [];
+    return [{
+      path: projectFilePath(node, fileName),
+      ...(node.dataset.key ? { key: node.dataset.key } : {}),
+      trigger: content
+    }];
+  });
+}
+
+function projectFileBaseName(path: string): string {
+  return path.split('/').at(-1) ?? path;
+}
+
+function projectFileTabMatches(
+  tab: HTMLElement,
+  entry: ProjectFileEntry,
+  entries: ProjectFileEntry[]
+): boolean {
+  if (entry.key && tab.classList.contains(`file-${entry.key}`)) return true;
+  const name = textOf(tab.querySelector('.file-name'));
+  if (name === entry.path) return true;
+  if (name !== projectFileBaseName(entry.path)) return false;
+  return entries.filter((candidate) => (
+    projectFileBaseName(candidate.path) === projectFileBaseName(entry.path)
+  )).length === 1;
+}
+
+function activeProjectTab(document: Document): HTMLElement | null {
+  return document.querySelector<HTMLElement>('.editor-tabs .tab-item.active');
+}
+
+function isProjectFileActive(
+  document: Document,
+  entry: ProjectFileEntry
+): boolean {
+  const tab = activeProjectTab(document);
+  if (!tab) return false;
+  return projectFileTabMatches(tab, entry, projectFileEntries(document));
+}
+
+function findProjectFileTab(
+  document: Document,
+  entry: ProjectFileEntry
+): HTMLElement | null {
+  const entries = projectFileEntries(document);
+  return Array.from(document.querySelectorAll<HTMLElement>('.editor-tabs .tab-item'))
+    .find((tab) => projectFileTabMatches(tab, entry, entries)) ?? null;
+}
+
+function activeProjectFilePath(
+  document: Document,
+  entries: ProjectFileEntry[]
+): string | undefined {
+  const tab = activeProjectTab(document);
+  if (!tab) return undefined;
+  const entry = entries.find((candidate) => projectFileTabMatches(tab, candidate, entries));
+  return (entry?.path ?? textOf(tab.querySelector('.file-name'))) || undefined;
+}
+
+function waitForProjectFile(
+  document: Document,
+  entry: ProjectFileEntry
+): Promise<void> {
+  if (isProjectFileActive(document, entry)) return Promise.resolve();
+
+  const MutationObserverConstructor = document.defaultView?.MutationObserver;
+  const root = document.body ?? document.documentElement;
+  if (!MutationObserverConstructor || !root) {
+    return Promise.reject(appError('EDITOR_NOT_FOUND', '当前页面不支持切换项目文件'));
+  }
+
+  return new Promise((resolve, reject) => {
+    let observer: MutationObserver;
+    let timer: ReturnType<typeof setTimeout>;
+
+    const cleanup = (): void => {
+      observer.disconnect();
+      clearTimeout(timer);
+    };
+    const inspect = (): void => {
+      if (!isProjectFileActive(document, entry)) return;
+      cleanup();
+      resolve();
+    };
+
+    observer = new MutationObserverConstructor(inspect);
+    observer.observe(root, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+      attributes: true
+    });
+    timer = setTimeout(() => {
+      cleanup();
+      reject(appError('EDITOR_NOT_FOUND', `切换项目文件失败：${entry.path}`));
+    }, PROJECT_FILE_SWITCH_TIMEOUT_MS);
+    inspect();
+  });
+}
+
+async function selectProjectFile(
+  document: Document,
+  entry: ProjectFileEntry
+): Promise<void> {
+  if (!isProjectFileActive(document, entry)) {
+    const tab = findProjectFileTab(document, entry);
+    const pending = waitForProjectFile(document, entry);
+    (tab ?? entry.trigger).click();
+    await pending;
+  }
+  // The tab state and the CodeMirror value are updated by separate Vue ticks.
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
+
+function collectVisibleProjectFiles(document: Document): ProjectFile[] {
+  const entries = projectFileEntries(document);
+  const activePath = activeProjectFilePath(document, entries);
+  const activeCode = extractEditorCode(document) ?? '';
+  return entries.map((entry) => ({
+    path: entry.path,
+    code: entry.path === activePath ? activeCode : '',
+    editable: isPythonProjectPath(entry.path)
+  }));
+}
+
+async function collectProjectFiles(
+  document: Document,
+  readCode?: CodeReader
+): Promise<ProjectFileSnapshot> {
+  const entries = projectFileEntries(document);
+  if (entries.length === 0) {
+    throw appError('EDITOR_NOT_FOUND', '未找到项目文件列表');
+  }
+
+  const activePath = activeProjectFilePath(document, entries);
+  const files: ProjectFile[] = [];
+  try {
+    for (const entry of entries) {
+      await selectProjectFile(document, entry);
+      if (!document.querySelector('.CodeMirror')) {
+        throw appError('EDITOR_NOT_FOUND', `未找到文件编辑器：${entry.path}`);
+      }
+      const code = readCode
+        ? await readCode()
+        : extractEditorCode(document) ?? '';
+      files.push({
+        path: entry.path,
+        code,
+        editable: isPythonProjectPath(entry.path)
+      });
+    }
+  } finally {
+    const originalEntry = entries.find((entry) => entry.path === activePath);
+    if (originalEntry) await selectProjectFile(document, originalEntry);
+  }
+
+  return { entries, files, ...(activePath ? { activePath } : {}) };
 }
 
 function fillInputs(document: Document): HTMLInputElement[] {
@@ -389,6 +624,11 @@ function findSubmitButton(document: Document): HTMLButtonElement | null {
   const programmingButton = document.querySelector<HTMLButtonElement>('.submit-btn button');
   if (programmingButton) return programmingButton;
 
+  const projectButton = Array.from(
+    document.querySelectorAll<HTMLButtonElement>('.project-exercise .toolbar button')
+  ).find((button) => textOf(button).includes('提交') && !textOf(button).includes('查看答案'));
+  if (projectButton) return projectButton;
+
   const fillButton = Array.from(
     document.querySelectorAll<HTMLButtonElement>('.code-fill-submit button')
   ).find((button) => textOf(button).includes('提交') && !textOf(button).includes('查看答案'));
@@ -400,6 +640,15 @@ function findSubmitButton(document: Document): HTMLButtonElement | null {
 
 function currentPath(location: Location): string {
   return `${location.pathname}${location.search}${location.hash}`;
+}
+
+function navigationKey(document: Document, location: Location): string {
+  return JSON.stringify([
+    currentPath(location),
+    Array.from(document.querySelectorAll('[exerciseid]')).map((exercise) => [
+      exercise.getAttribute('lessonid'), exercise.getAttribute('exerciseid')
+    ])
+  ]);
 }
 
 function nextNavigationTarget(control: HTMLElement, location: Location): string | null {
@@ -417,20 +666,49 @@ function nextNavigationTarget(control: HTMLElement, location: Location): string 
 function clickNextItemButton(
   control: HTMLElement,
   location: Location,
-  navigate: (url: string) => void
+  navigate: (url: string) => void,
+  allowSubmissionFallback = false
 ): void {
   const document = control.ownerDocument;
   if (nextItemClicked.has(document)) return;
-  nextItemClicked.add(document);
+  const attempt = Symbol();
+  nextItemClicked.set(document, attempt);
+  const keyBeforeClick = navigationKey(document, location);
+  const isCurrent = (): boolean => nextItemClicked.get(document) === attempt
+    && navigationKey(document, location) === keyBeforeClick
+    && (!allowSubmissionFallback || !hasSubmissionFailure(document));
 
-  const targetUrl = nextNavigationTarget(control, location);
-  const pathBeforeClick = currentPath(location);
-  control.click();
+  const click = (nextControl: HTMLElement, onNoNavigation?: () => void): void => {
+    if (!isCurrent()) return;
+    const targetUrl = nextNavigationTarget(nextControl, location);
+    nextControl.click();
+    if (!targetUrl && !onNoNavigation) return;
+    setTimeout(() => {
+      if (!isCurrent()) return;
+      if (targetUrl) {
+        navigate(targetUrl);
+        if (onNoNavigation) {
+          setTimeout(() => { if (isCurrent()) onNoNavigation(); }, NEXT_NAVIGATION_FALLBACK_MS);
+        }
+      } else {
+        onNoNavigation?.();
+      }
+    }, NEXT_NAVIGATION_FALLBACK_MS);
+  };
 
-  if (!targetUrl) return;
-  setTimeout(() => {
-    if (currentPath(location) === pathBeforeClick) navigate(targetUrl);
-  }, NEXT_NAVIGATION_FALLBACK_MS);
+  if (!allowSubmissionFallback || control === findHeaderNextControl(document)) {
+    click(control);
+    return;
+  }
+  const clickHeader = (): void => {
+    const header = findHeaderNextControl(document);
+    if (header) click(header);
+  };
+  click(control, () => {
+    const footer = findNextVideoControl(document);
+    if (footer && footer !== control) click(footer, clickHeader);
+    else clickHeader();
+  });
 }
 
 export class AlphaCodingAdapter implements SiteAdapter {
@@ -441,7 +719,8 @@ export class AlphaCodingAdapter implements SiteAdapter {
     private readonly document: Document,
     private readonly location: Location,
     private readonly fillCode: CodeFiller = defaultFillCode,
-    private readonly navigate: (url: string) => void = (url) => location.assign(url)
+    private readonly navigate: (url: string) => void = (url) => location.assign(url),
+    private readonly readCode?: CodeReader
   ) {}
 
   match(): boolean {
@@ -450,6 +729,10 @@ export class AlphaCodingAdapter implements SiteAdapter {
 
   detectQuestionType(): QuestionType {
     const typeName = textOf(this.document.querySelector('.exercise-type-name'));
+    if ((typeName.includes('综合项目') || this.document.querySelector('.project-exercise'))
+      && projectFileEntries(this.document).some((entry) => isPythonProjectPath(entry.path))) {
+      return 'project';
+    }
     if (typeName === '编程题') return 'programming';
     if (typeName.includes('填空') && fillInputs(this.document).length > 0) return 'fill';
     if (/(?:选择|单选|多选|判断)题?/.test(typeName) && choiceInputs(this.document).length > 0) {
@@ -460,13 +743,15 @@ export class AlphaCodingAdapter implements SiteAdapter {
 
   extractQuestion(): Question | null {
     const type = this.detectQuestionType();
-    if (type !== 'programming' && type !== 'choice' && type !== 'fill') return null;
+    if (type !== 'programming' && type !== 'project' && type !== 'choice' && type !== 'fill') {
+      return null;
+    }
 
     const content = extractQuestionContent(this.document, type);
     if (!content) return null;
 
     const title = textOf(
-      this.document.querySelector('.exercise-content h2, .lesson-title h1')
+      this.document.querySelector('.exercise-content .exercise-title, .exercise-content h2, .lesson-title h1')
     ) || undefined;
     const requirements = extractTaskRequirements(this.document);
 
@@ -504,6 +789,18 @@ export class AlphaCodingAdapter implements SiteAdapter {
       };
     }
 
+    if (type === 'project') {
+      const files = collectVisibleProjectFiles(this.document);
+      if (!files.some((file) => file.editable)) return null;
+      return {
+        type,
+        ...(title ? { title } : {}),
+        content,
+        ...(requirements ? { requirements } : {}),
+        files
+      };
+    }
+
     const language = extractLanguage(content);
     const examples = collectExamples(this.document);
     const editorCode = extractEditorCode(this.document);
@@ -519,7 +816,20 @@ export class AlphaCodingAdapter implements SiteAdapter {
     };
   }
 
+  async extractQuestionAsync(): Promise<Question | null> {
+    if (this.detectQuestionType() !== 'project') return this.extractQuestion();
+    const question = this.extractQuestion();
+    if (!question || question.type !== 'project') return null;
+    const snapshot = await collectProjectFiles(this.document, this.readCode);
+    return { ...question, files: snapshot.files };
+  }
+
   async fillAnswer(answer: AIAnswer): Promise<void> {
+    if (answer.type === 'project') {
+      await this.fillProjectAnswer(answer);
+      return;
+    }
+
     if (answer.type === 'fill') {
       const inputs = fillInputs(this.document);
       if (inputs.length === 0) {
@@ -569,6 +879,83 @@ export class AlphaCodingAdapter implements SiteAdapter {
     await this.fillCode(answer.code);
   }
 
+  private async fillProjectAnswer(answer: ProjectAnswer): Promise<void> {
+    const snapshot = await collectProjectFiles(this.document, this.readCode);
+    const sourceByPath = new Map(
+      snapshot.files.map((file) => [normalizeProjectPath(file.path), file])
+    );
+    const editableFiles = snapshot.files.filter((file) => (
+      file.editable && isPythonProjectPath(file.path)
+    ));
+    const candidates = new Map<string, string>();
+
+    for (const file of answer.files) {
+      const normalizedPath = normalizeProjectPath(file.path);
+      const sourceFile = sourceByPath.get(normalizedPath);
+      if (!sourceFile?.editable || !isPythonProjectPath(sourceFile.path)) {
+        throw appError('EDITOR_WRITE_FAILED', `只允许修改 Python 文件：${file.path}`);
+      }
+      if (candidates.has(normalizedPath)) {
+        throw appError('EDITOR_WRITE_FAILED', `重复的项目文件：${sourceFile.path}`);
+      }
+      if (!preservesOriginalCode(sourceFile.code, file.code)) {
+        throw appError('EDITOR_WRITE_FAILED', `AI 修改了 ${sourceFile.path} 的原有代码`);
+      }
+      candidates.set(normalizedPath, file.code);
+    }
+
+    if (candidates.size !== editableFiles.length) {
+      const missingFile = editableFiles.find((file) => (
+        !candidates.has(normalizeProjectPath(file.path))
+      ));
+      throw appError(
+        'EDITOR_WRITE_FAILED',
+        `AI 未返回 Python 文件：${missingFile?.path ?? '数量不匹配'}`
+      );
+    }
+
+    const writeTargets = editableFiles.map((file) => {
+      const entry = snapshot.entries.find((candidate) => (
+        normalizeProjectPath(candidate.path) === normalizeProjectPath(file.path)
+      ));
+      const code = candidates.get(normalizeProjectPath(file.path));
+      if (!entry || code === undefined) {
+        throw appError('EDITOR_NOT_FOUND', `未找到项目文件：${file.path}`);
+      }
+      return { entry, file, code };
+    });
+    const writtenTargets: typeof writeTargets = [];
+
+    try {
+      for (const target of writeTargets) {
+        await selectProjectFile(this.document, target.entry);
+        // Mark before calling the bridge: a lost response may occur after setValue().
+        writtenTargets.push(target);
+        await this.fillCode(target.code);
+      }
+    } catch (error) {
+      let rollbackFailed = false;
+      for (const target of writtenTargets.reverse()) {
+        try {
+          await selectProjectFile(this.document, target.entry);
+          await this.fillCode(target.file.code);
+        } catch {
+          rollbackFailed = true;
+        }
+      }
+      if (rollbackFailed) {
+        throw appError(
+          'EDITOR_WRITE_FAILED',
+          '项目文件写入失败，自动回滚也失败，请手动检查并恢复代码'
+        );
+      }
+      throw error;
+    } finally {
+      const originalEntry = snapshot.entries.find((entry) => entry.path === snapshot.activePath);
+      if (originalEntry) await selectProjectFile(this.document, originalEntry);
+    }
+  }
+
   async submitAnswer(): Promise<void> {
     submissionInFlight = true;
     try {
@@ -592,7 +979,7 @@ export class AlphaCodingAdapter implements SiteAdapter {
           button.click();
           const outcome = await outcomePromise;
           if (outcome.type === 'success') {
-            clickNextItemButton(outcome.nextControl, this.location, this.navigate);
+            clickNextItemButton(outcome.nextControl, this.location, this.navigate, true);
             return;
           }
         }
@@ -608,7 +995,7 @@ export class AlphaCodingAdapter implements SiteAdapter {
       if (outcome.type === 'failure') {
         throw appError('SUBMIT_FAILED', '提交后检测到答案错误，已暂停自动处理，请手动修改答案');
       }
-      clickNextItemButton(outcome.nextControl, this.location, this.navigate);
+      clickNextItemButton(outcome.nextControl, this.location, this.navigate, true);
     } finally {
       submissionInFlight = false;
     }
@@ -632,7 +1019,7 @@ export class AlphaCodingAdapter implements SiteAdapter {
     const clickIfReady = (): void => {
       if (submissionInFlight) return;
       const nextControl = findSubmissionNextControl(this.document);
-      if (nextControl) clickNextItemButton(nextControl, this.location, this.navigate);
+      if (nextControl) clickNextItemButton(nextControl, this.location, this.navigate, true);
     };
 
     clickIfReady();

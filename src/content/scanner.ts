@@ -33,6 +33,7 @@ export function scanPage(
   return {
     adapter: adapter.name,
     supported: question?.type === 'programming'
+      || question?.type === 'project'
       || question?.type === 'choice'
       || question?.type === 'fill'
       || supportsVideo,
@@ -42,21 +43,29 @@ export function scanPage(
 }
 
 export function createDebouncedScanner<T>(
-  scan: () => T,
+  scan: () => T | Promise<T>,
   emit: (value: T) => void,
   delayMs = 300
 ): () => void {
   let timeout: ReturnType<typeof setTimeout> | undefined;
   let previousSnapshot: string | undefined;
 
+  const emitIfChanged = (value: T): void => {
+    const snapshot = JSON.stringify(value);
+    if (snapshot !== previousSnapshot) {
+      previousSnapshot = snapshot;
+      emit(value);
+    }
+  };
+
   return () => {
     if (timeout !== undefined) clearTimeout(timeout);
     timeout = setTimeout(() => {
       const value = scan();
-      const snapshot = JSON.stringify(value);
-      if (snapshot !== previousSnapshot) {
-        previousSnapshot = snapshot;
-        emit(value);
+      if (value instanceof Promise) {
+        void value.then(emitIfChanged);
+      } else {
+        emitIfChanged(value);
       }
     }, delayMs);
   };

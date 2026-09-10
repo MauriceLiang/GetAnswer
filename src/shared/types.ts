@@ -1,4 +1,4 @@
-export type QuestionType = 'programming' | 'choice' | 'fill' | 'unknown';
+export type QuestionType = 'programming' | 'project' | 'choice' | 'fill' | 'unknown';
 
 export type ChoiceSelectionMode = 'single' | 'multiple';
 
@@ -21,6 +21,7 @@ export interface Question {
   examples?: ExampleCase[];
   language?: string;
   editorCode?: string;
+  files?: ProjectFile[];
   selectionMode?: ChoiceSelectionMode;
   options?: ChoiceOption[];
   blankCount?: number;
@@ -41,7 +42,23 @@ export interface FillAnswer {
   values: string[];
 }
 
-export type AIAnswer = ProgrammingAnswer | ChoiceAnswer | FillAnswer;
+export interface ProjectFile {
+  path: string;
+  code: string;
+  editable: boolean;
+}
+
+export interface ProjectAnswerFile {
+  path: string;
+  code: string;
+}
+
+export interface ProjectAnswer {
+  type: 'project';
+  files: ProjectAnswerFile[];
+}
+
+export type AIAnswer = ProgrammingAnswer | ProjectAnswer | ChoiceAnswer | FillAnswer;
 
 export interface PageContext {
   adapter: string;
