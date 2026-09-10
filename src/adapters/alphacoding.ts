@@ -140,36 +140,68 @@ function hasInlineSubmissionResult(document: Document): boolean {
     });
 }
 
-function findSubmissionNextControl(document: Document): HTMLElement | null {
-  const dialogButton = findNextItemButton(document);
-  if (dialogButton) return dialogButton;
-  return hasInlineSubmissionResult(document) ? findNextVideoControl(document) : null;
+function hasSubmissionFailure(document: Document): boolean {
+  const view = document.defaultView;
+  const failurePattern = /作答错误|回答错误|答案错误|不正确|未通过/;
+  return Array.from(document.querySelectorAll(
+    '.check-result-status, .el-dialog__body, [role="dialog"], .el-overlay-dialog'
+  )).some((result) => isVisible(result, view) && failurePattern.test(textOf(result)));
 }
 
-function waitForSubmissionNextControl(document: Document): Promise<HTMLElement> {
-  const existingControl = findSubmissionNextControl(document);
-  if (existingControl) return Promise.resolve(existingControl);
+const submissionResultSelector =
+  '.check-result-status, .el-dialog__body, [role="dialog"], .el-overlay-dialog';
 
+function isSubmissionResultNode(node: Node): boolean {
+  const element = node.nodeType === Node.ELEMENT_NODE
+    ? node as Element
+    : node.parentElement;
+  return element?.matches(submissionResultSelector) === true
+    || element?.closest(submissionResultSelector) !== null;
+}
+
+type SubmissionOutcome =
+  | { type: 'success'; nextControl: HTMLElement }
+  | { type: 'failure' };
+
+function waitForSubmissionOutcome(document: Document): Promise<SubmissionOutcome> {
   const MutationObserverConstructor = document.defaultView?.MutationObserver;
   const root = document.body ?? document.documentElement;
   if (!MutationObserverConstructor || !root) {
-    return Promise.reject(appError('SUBMIT_FAILED', '提交后未检测到成功结果，未自动进入下一项'));
+    return Promise.reject(appError('SUBMIT_FAILED', '提交后未检测到答题结果'));
   }
-
   return new Promise((resolve, reject) => {
     let observer: MutationObserver;
     let timer: ReturnType<typeof setTimeout>;
+    let resultMutated = false;
 
     const cleanup = (): void => {
       observer.disconnect();
       clearTimeout(timer);
     };
 
-    observer = new MutationObserverConstructor(() => {
+    const inspect = (): void => {
+      if (!resultMutated) return;
       const nextControl = findSubmissionNextControl(document);
-      if (!nextControl) return;
-      cleanup();
-      resolve(nextControl);
+      if (nextControl) {
+        cleanup();
+        resolve({ type: 'success', nextControl });
+        return;
+      }
+      if (hasSubmissionFailure(document)) {
+        cleanup();
+        resolve({ type: 'failure' });
+      }
+    };
+
+    observer = new MutationObserverConstructor((records) => {
+      if (records.some((record) => (
+        isSubmissionResultNode(record.target)
+        || Array.from(record.addedNodes).some(isSubmissionResultNode)
+        || Array.from(record.removedNodes).some(isSubmissionResultNode)
+      ))) {
+        resultMutated = true;
+      }
+      inspect();
     });
     observer.observe(root, {
       childList: true,
@@ -179,9 +211,15 @@ function waitForSubmissionNextControl(document: Document): Promise<HTMLElement> 
     });
     timer = setTimeout(() => {
       cleanup();
-      reject(appError('SUBMIT_FAILED', '提交后未检测到成功结果，未自动进入下一项'));
+      reject(appError('SUBMIT_FAILED', '提交后未检测到答题结果'));
     }, SUBMIT_RESULT_TIMEOUT_MS);
   });
+}
+
+function findSubmissionNextControl(document: Document): HTMLElement | null {
+  const dialogButton = findNextItemButton(document);
+  if (dialogButton) return dialogButton;
+  return hasInlineSubmissionResult(document) ? findNextVideoControl(document) : null;
 }
 
 function extractEditorCode(document: Document): string | undefined {
@@ -200,22 +238,31 @@ function extractEditorCode(document: Document): string | undefined {
 }
 
 function fillInputs(document: Document): HTMLInputElement[] {
-  return Array.from(document.querySelectorAll<HTMLInputElement>('.blank-input input.blank'));
+  return Array.from(document.querySelectorAll<HTMLInputElement>(
+    '.code-fill-exercise input.blank, .simple-fill-blank-exercise input.blank, .blank-input input.blank'
+  ));
 }
 
 function extractFillCode(document: Document): { code: string; blankCount: number } {
-  let blankCount = 0;
-  const lines = Array.from(document.querySelectorAll('.CodeMirror-line')).map((line) => {
+  const inputs = fillInputs(document);
+  const inputIndexes = new Map(inputs.map((input, index) => [input, index + 1]));
+  const editor = document.querySelector<HTMLElement>(
+    '.code-fill-exercise .CodeMirror, .simple-fill-blank-exercise .CodeMirror'
+  );
+  const lines = Array.from(editor?.querySelectorAll('.CodeMirror-line') ?? []).map((line) => {
     const clone = line.cloneNode(true) as HTMLElement;
-    clone.querySelectorAll('.blank-input input.blank').forEach((input) => {
-      blankCount += 1;
+    const originalInputs = Array.from(line.querySelectorAll<HTMLInputElement>('input.blank'));
+    clone.querySelectorAll<HTMLInputElement>('input.blank').forEach((input, index) => {
+      const blankIndex = inputIndexes.get(originalInputs[index]);
       const blankContainer = input.closest('.blank-input') ?? input;
-      blankContainer.replaceWith(document.createTextNode(`{{BLANK_${blankCount}}}`));
+      blankContainer.replaceWith(document.createTextNode(
+        blankIndex === undefined ? '' : `{{BLANK_${blankIndex}}}`
+      ));
     });
     return clone.textContent?.replace(/\u00a0/g, ' ') ?? '';
   });
 
-  return { code: lines.join('\n').trim(), blankCount };
+  return { code: lines.join('\n').trim(), blankCount: inputs.length };
 }
 
 function extractQuestionContent(document: Document, type: QuestionType): string {
@@ -229,6 +276,24 @@ function extractQuestionContent(document: Document, type: QuestionType): string 
   const content = selectors.map((selector) => textOf(document.querySelector(selector)))
     .find((value) => value.length > 0) ?? '';
   return content.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).join('\n');
+}
+
+function extractTaskRequirements(document: Document): string | undefined {
+  const taskDescriptions = Array.from(
+    document.querySelectorAll('.exercise-tasks .task-description .markdown-body')
+  );
+  const fallbackDescriptions = taskDescriptions.length > 0
+    ? taskDescriptions
+    : Array.from(document.querySelectorAll('.exercise-tasks .task-description'));
+  const requirements = fallbackDescriptions
+    .map((element) => textOf(element))
+    .filter((value) => value.length > 0)
+    .join('\n');
+  return requirements
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join('\n') || undefined;
 }
 
 function collectExamples(document: Document): ExampleCase[] | undefined {
@@ -249,6 +314,39 @@ function collectExamples(document: Document): ExampleCase[] | undefined {
   return examples.length > 0 ? examples : undefined;
 }
 
+function collectFillExamples(document: Document): ExampleCase[] | undefined {
+  const description = document.querySelector(
+    '.code-fill-exercise .exercise-description .markdown-body, '
+      + '.simple-fill-blank-exercise .exercise-description .markdown-body'
+  );
+  if (!description) return undefined;
+
+  const examples: ExampleCase[] = [];
+  let pendingInput: string | undefined;
+  for (const heading of Array.from(description.querySelectorAll('h3, h4'))) {
+    const label = textOf(heading);
+    const codeBlock = heading.nextElementSibling?.matches('pre')
+      ? heading.nextElementSibling
+      : null;
+    if (!codeBlock) continue;
+
+    const value = textOf(codeBlock);
+    if (/输入|input/i.test(label)) {
+      pendingInput = value;
+      continue;
+    }
+    if (!/输出|output/i.test(label)) continue;
+
+    const example: ExampleCase = {};
+    if (pendingInput !== undefined) example.input = pendingInput;
+    if (value) example.output = value;
+    if (Object.keys(example).length > 0) examples.push(example);
+    pendingInput = undefined;
+  }
+
+  return examples.length > 0 ? examples : undefined;
+}
+
 function extractLanguage(content: string): string | undefined {
   const match = content.match(/(?:编程语言|语言)\s*[:：]\s*([A-Za-z][A-Za-z0-9+#.-]*)/);
   return match?.[1];
@@ -258,6 +356,17 @@ function choiceInputs(document: Document): HTMLInputElement[] {
   return Array.from(document.querySelectorAll<HTMLInputElement>(
     '.choice-options-list input[type="radio"], .choice-options-list input[type="checkbox"]'
   ));
+}
+
+function selectSingleChoice(document: Document, index: number): void {
+  const inputs = choiceInputs(document);
+  const selectedInput = inputs[index];
+  if (!selectedInput) throw appError('EDITOR_WRITE_FAILED', '未找到要选择的选项');
+
+  for (const [inputIndex, input] of inputs.entries()) {
+    const shouldBeChecked = inputIndex === index;
+    if (input.checked !== shouldBeChecked) input.click();
+  }
 }
 
 function choiceOptions(document: Document): ChoiceOption[] {
@@ -359,6 +468,7 @@ export class AlphaCodingAdapter implements SiteAdapter {
     const title = textOf(
       this.document.querySelector('.exercise-content h2, .lesson-title h1')
     ) || undefined;
+    const requirements = extractTaskRequirements(this.document);
 
     if (type === 'choice') {
       const inputs = choiceInputs(this.document);
@@ -369,6 +479,7 @@ export class AlphaCodingAdapter implements SiteAdapter {
         type,
         ...(title ? { title } : {}),
         content,
+        ...(requirements ? { requirements } : {}),
         selectionMode: choiceSelectionMode(
           textOf(this.document.querySelector('.exercise-type-name')),
           inputs
@@ -380,11 +491,14 @@ export class AlphaCodingAdapter implements SiteAdapter {
     if (type === 'fill') {
       const fillCode = extractFillCode(this.document);
       if (fillCode.blankCount === 0 || !fillCode.code) return null;
+      const examples = collectFillExamples(this.document);
 
       return {
         type,
         ...(title ? { title } : {}),
         content,
+        ...(requirements ? { requirements } : {}),
+        ...(examples ? { examples } : {}),
         editorCode: fillCode.code,
         blankCount: fillCode.blankCount
       };
@@ -398,6 +512,7 @@ export class AlphaCodingAdapter implements SiteAdapter {
       type: 'programming',
       ...(title ? { title } : {}),
       content,
+      ...(requirements ? { requirements } : {}),
       ...(language ? { language } : {}),
       ...(examples ? { examples } : {}),
       ...(editorCode ? { editorCode } : {})
@@ -455,17 +570,45 @@ export class AlphaCodingAdapter implements SiteAdapter {
   }
 
   async submitAnswer(): Promise<void> {
-    const button = findSubmitButton(this.document);
-    if (!button) throw appError('SUBMIT_FAILED', '未找到提交按钮');
-
     submissionInFlight = true;
     try {
       nextItemClicked.delete(this.document);
+
+      const inputs = choiceInputs(this.document);
+      const selectedIndex = inputs.findIndex((input) => input.checked);
+      if (inputs.length > 0 && inputs[0].type === 'radio' && selectedIndex >= 0) {
+        const attemptIndexes = [
+          selectedIndex,
+          ...inputs.map((_, index) => index).filter((index) => index !== selectedIndex)
+        ];
+
+        for (const [attempt, index] of attemptIndexes.entries()) {
+          if (attempt > 0) selectSingleChoice(this.document, index);
+
+          const button = findSubmitButton(this.document);
+          if (!button) throw appError('SUBMIT_FAILED', '未找到提交按钮');
+
+          const outcomePromise = waitForSubmissionOutcome(this.document);
+          button.click();
+          const outcome = await outcomePromise;
+          if (outcome.type === 'success') {
+            clickNextItemButton(outcome.nextControl, this.location, this.navigate);
+            return;
+          }
+        }
+
+        throw appError('SUBMIT_FAILED', '单选题已尝试所有选项，仍未通过');
+      }
+
+      const button = findSubmitButton(this.document);
+      if (!button) throw appError('SUBMIT_FAILED', '未找到提交按钮');
+      const outcomePromise = waitForSubmissionOutcome(this.document);
       button.click();
-      // Let the page render its checking state before reading the result.
-      await Promise.resolve();
-      const nextControl = await waitForSubmissionNextControl(this.document);
-      clickNextItemButton(nextControl, this.location, this.navigate);
+      const outcome = await outcomePromise;
+      if (outcome.type === 'failure') {
+        throw appError('SUBMIT_FAILED', '提交后检测到答案错误，已暂停自动处理，请手动修改答案');
+      }
+      clickNextItemButton(outcome.nextControl, this.location, this.navigate);
     } finally {
       submissionInFlight = false;
     }

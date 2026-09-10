@@ -1,4 +1,8 @@
-import type { AIAnswer, Question, QuestionType } from '../shared/types';
+import type {
+  AIAnswer,
+  Question,
+  QuestionType
+} from '../shared/types';
 
 export type CodeFiller = (code: string) => Promise<void>;
 

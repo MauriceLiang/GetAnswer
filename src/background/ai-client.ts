@@ -33,15 +33,33 @@ export function buildPrompt(question: Question): string {
       { length: blankCount },
       (_, index) => `"答案${index + 1}"`
     ).join(',')}]`;
+    const hasCodePlaceholders = question.editorCode?.includes('{{BLANK_') ?? false;
+    const fillGuidance = hasCodePlaceholders
+      ? [
+        '请根据题目说明和带有 BLANK_N 占位符的代码，按空位出现顺序给出每个输入框应填写的内容。'
+      ]
+      : [
+        '这道题的填空输入框独立于代码编辑器，代码区只作为解题上下文。',
+        '请按页面输入框顺序给出每个输入框应填写的内容。'
+      ];
+    const codeLabel = hasCodePlaceholders
+      ? '完整代码区内容（与题目说明一起发送）'
+      : '代码上下文';
+    const examples = question.examples?.map((example, index) => [
+      `示例 ${index + 1} 输入：${example.input ?? ''}`,
+      `示例 ${index + 1} 输出：${example.output ?? ''}`
+    ].join('\n')).join('\n') || '无';
     return [
       '你是在线课程程序填空题求解器。',
-      '请根据题目说明和带有 BLANK_N 占位符的代码，按空位出现顺序给出每个输入框应填写的内容。',
+      ...fillGuidance,
       `严格按 ${blankOrder.join('、')} 的顺序返回 ${blankCount} 个答案。`,
       `只返回 JSON 字符串数组，例如：${answerExample}。不要返回 Markdown、解释、编号或其他文字。`,
       '每个数组元素对应一个填空输入框，可以是标识符、表达式或代码片段；不要改写整个程序。',
       `题目标题：${question.title ?? ''}`,
       `题目说明：\n${question.content}`,
-      `代码骨架：\n${question.editorCode ?? ''}`
+      `任务与要求（验收标准）：\n${question.requirements ?? '未提供'}`,
+      `${codeLabel}：\n${question.editorCode ?? ''}`,
+      `样例输入输出：\n${examples}`
     ].join('\n\n');
   }
 
@@ -56,10 +74,13 @@ export function buildPrompt(question: Question): string {
   return [
     '你是编程题求解器。',
     '这是在线课程编程题，请根据题目约定完成函数或单个可直接运行的脚本源文件。',
+    '题目正文、任务与要求、代码输入区都是必读上下文；任务与要求是验收标准，必须逐条满足。',
     '题目明确规定的函数签名、输入输出方式、返回值和禁用函数必须优先遵守。',
     '评测系统会使用多组真实测试用例：根据实际输入或函数参数计算结果，不要把示例答案写死。',
     '不要生成项目结构、多个文件、README、依赖安装说明、测试框架、伪代码或解题说明。',
-    '如果代码区已有代码，请优先在其基础上补全或修正，保留函数名、参数和可用的输入输出结构。',
+    '代码输入区是平台提供的初始程序。不得随意删除、改写或替换代码输入区中的预设内容；保留预设数据、导入、函数签名、函数调用、输入输出结构和测试代码，只在完成任务所必需的最小范围内修改。',
+    '编程题不得修改代码原有输入区的内容；原有输入输出、预设数据、函数签名和测试代码必须保留，只能在必要位置补充实现。',
+    '如果需要返回完整代码，必须以代码输入区为基线保留所有无关行，不得把预设值替换成示例值。',
     '只返回代码正文，不要 Markdown 代码块，不要解释。',
     '题目要求读取标准输入时，Python 必须使用 input() 读取在线平台提供的输入；禁止使用 sys.stdin、命令行参数、文件或环境变量读取输入。',
     '输入函数不得带提示文本，例如不要写 input("请输入...")，提示语会被判题系统当作输出。',
@@ -69,7 +90,8 @@ export function buildPrompt(question: Question): string {
     `题目标题：${question.title ?? ''}`,
     `编程语言：${question.language ?? 'Python'}`,
     `题目内容：\n${question.content}`,
-    `已有代码：\n${editorCode}`,
+    `任务与要求（验收标准）：\n${question.requirements ?? '未提供'}`,
+    `已有代码（代码输入区）：\n${editorCode}`,
     `样例：\n${examples}`
   ].join('\n\n');
 }

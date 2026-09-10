@@ -69,6 +69,7 @@ function getQuestionKey(value: Question): string {
     type: value.type,
     title: value.title ?? '',
     content: value.content,
+    requirements: value.requirements ?? '',
     examples: value.examples ?? [],
     language: value.language ?? '',
     editorCode: value.editorCode ?? '',

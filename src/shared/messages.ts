@@ -70,6 +70,7 @@ function isQuestion(value: unknown): value is Question {
   if (typeof value.content !== 'string') return false;
   if (value.id !== undefined && typeof value.id !== 'string') return false;
   if (value.title !== undefined && typeof value.title !== 'string') return false;
+  if (value.requirements !== undefined && typeof value.requirements !== 'string') return false;
   if (value.language !== undefined && typeof value.language !== 'string') return false;
   if (value.editorCode !== undefined && typeof value.editorCode !== 'string') return false;
   if (value.selectionMode !== undefined

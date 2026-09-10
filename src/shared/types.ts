@@ -17,6 +17,7 @@ export interface Question {
   type: QuestionType;
   title?: string;
   content: string;
+  requirements?: string;
   examples?: ExampleCase[];
   language?: string;
   editorCode?: string;

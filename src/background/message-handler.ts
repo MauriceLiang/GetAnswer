@@ -1,9 +1,19 @@
 import type { ExtensionMessage } from '../shared/messages';
-import type { AIAnswer, AIConfig, AppError, AppErrorCode, Question } from '../shared/types';
+import type {
+  AIAnswer,
+  AIConfig,
+  AppError,
+  AppErrorCode,
+  Question
+} from '../shared/types';
 import { AppErrorException, appError } from '../shared/errors';
 
 export interface MessageHandlerDependencies {
-  askAI: (question: Question, config: AIConfig, signal?: AbortSignal) => Promise<AIAnswer>;
+  askAI: (
+    question: Question,
+    config: AIConfig,
+    signal?: AbortSignal
+  ) => Promise<AIAnswer>;
   testAIConnection: (config: AIConfig) => Promise<void>;
   getConfig: () => Promise<AIConfig>;
   getActiveTabId: () => Promise<number | null>;
@@ -179,10 +189,15 @@ export function createMessageHandler(dependencies: MessageHandlerDependencies) {
     try {
       notifyCorrelated(dependencies, { type: 'STATUS', status: 'requesting' }, questionKey);
       const config = await dependencies.getConfig();
-      const answer = await dependencies.askAI(message.question, config, operation.controller.signal);
+      const answer = await dependencies.askAI(
+        message.question,
+        config,
+        operation.controller.signal
+      );
       if (operation.controller.signal.aborted) {
         return { filled: false, cancelled: true } satisfies SolveResult;
       }
+
       notifyCorrelated(dependencies, { type: 'AI_RESULT', answer }, questionKey);
       notifyCorrelated(dependencies, { type: 'STATUS', status: 'filling' }, questionKey);
 
