@@ -13,6 +13,8 @@ import { isPythonProjectPath } from './project-files';
 export type ExtensionMessage =
   | { type: 'GET_PAGE_CONTEXT' }
   | { type: 'PAGE_CONTEXT'; data: PageContext }
+  | { type: 'GET_PAGE_ANSWER' }
+  | { type: 'PAGE_ANSWER'; answer?: AIAnswer }
   | { type: 'REFRESH_PAGE' }
   | { type: 'REFRESH_PAGE_RESULT'; success: boolean; error?: AppError }
   | { type: 'STOP_SOLVING' }
@@ -21,11 +23,17 @@ export type ExtensionMessage =
   | { type: 'TEST_CONNECTION' }
   | { type: 'TEST_CONNECTION_RESULT'; success: boolean; error?: AppError }
   | { type: 'ADVANCE_VIDEO' }
-  | { type: 'AI_RESULT'; answer: AIAnswer; questionKey?: string }
+  | { type: 'AI_RESULT'; answer: AIAnswer; questionKey?: string; source?: 'page' | 'ai' }
   | { type: 'FILL_ANSWER'; answer: AIAnswer; autoSubmit?: boolean }
   | { type: 'FILL_RESULT'; success: boolean; error?: AppError }
   | { type: 'VIDEO_RESULT'; success: boolean; error?: AppError }
-  | { type: 'STATUS'; status: TaskStatus; error?: AppError; questionKey?: string };
+  | {
+    type: 'STATUS';
+    status: TaskStatus;
+    error?: AppError;
+    questionKey?: string;
+    phase?: 'page-answer' | 'ai';
+  };
 
 type RecordValue = Record<string, unknown>;
 
@@ -201,6 +209,10 @@ export function isExtensionMessage(value: unknown): value is ExtensionMessage {
       return true;
     case 'PAGE_CONTEXT':
       return isPageContext(value.data);
+    case 'GET_PAGE_ANSWER':
+      return true;
+    case 'PAGE_ANSWER':
+      return value.answer === undefined || isAIAnswer(value.answer);
     case 'REFRESH_PAGE':
       return true;
     case 'REFRESH_PAGE_RESULT':
@@ -222,7 +234,8 @@ export function isExtensionMessage(value: unknown): value is ExtensionMessage {
         && (value.error === undefined || isAppError(value.error));
     case 'AI_RESULT':
       return isAIAnswer(value.answer)
-        && (value.questionKey === undefined || typeof value.questionKey === 'string');
+        && (value.questionKey === undefined || typeof value.questionKey === 'string')
+        && (value.source === undefined || value.source === 'page' || value.source === 'ai');
     case 'FILL_ANSWER':
       return isAIAnswer(value.answer)
         && (value.autoSubmit === undefined || typeof value.autoSubmit === 'boolean');
@@ -235,7 +248,8 @@ export function isExtensionMessage(value: unknown): value is ExtensionMessage {
     case 'STATUS':
       return isTaskStatus(value.status)
         && (value.error === undefined || isAppError(value.error))
-        && (value.questionKey === undefined || typeof value.questionKey === 'string');
+        && (value.questionKey === undefined || typeof value.questionKey === 'string')
+        && (value.phase === undefined || value.phase === 'page-answer' || value.phase === 'ai');
     default:
       return false;
   }

@@ -13,6 +13,7 @@ export interface SiteAdapter {
   detectQuestionType(): QuestionType;
   extractQuestion(): Question | null;
   extractQuestionAsync?(): Promise<Question | null>;
+  extractAnswer?(): Promise<AIAnswer | null>;
   fillAnswer(answer: AIAnswer): Promise<void>;
   submitAnswer?(): Promise<void>;
   watchSubmissionResult?(): void;

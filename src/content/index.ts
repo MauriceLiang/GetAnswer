@@ -120,6 +120,22 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === 'GET_PAGE_ANSWER') {
+    const adapter = findAdapter(document, window.location, fillCode, readCode);
+    if (!adapter?.extractAnswer) {
+      sendResponse({ type: 'PAGE_ANSWER' } satisfies ExtensionMessage);
+      return;
+    }
+
+    void adapter.extractAnswer()
+      .then((answer) => sendResponse({
+        type: 'PAGE_ANSWER',
+        ...(answer ? { answer } : {})
+      } satisfies ExtensionMessage))
+      .catch(() => sendResponse({ type: 'PAGE_ANSWER' } satisfies ExtensionMessage));
+    return true;
+  }
+
   if (message.type === 'STOP_SOLVING') {
     solveGeneration += 1;
     sendResponse({ type: 'STOP_SOLVING_RESULT', success: true } satisfies ExtensionMessage);

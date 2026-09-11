@@ -2,6 +2,8 @@ export type QuestionType = 'programming' | 'project' | 'choice' | 'fill' | 'unkn
 
 export type ChoiceSelectionMode = 'single' | 'multiple';
 
+export type AnswerMode = 'page' | 'ai' | 'hybrid';
+
 export interface ExampleCase {
   input?: string;
   output?: string;
@@ -70,6 +72,7 @@ export interface PageContext {
 }
 
 export interface AIConfig {
+  answerMode: AnswerMode;
   baseUrl: string;
   apiKey: string;
   model: string;

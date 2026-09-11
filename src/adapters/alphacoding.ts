@@ -16,8 +16,11 @@ import {
 import type { CodeFiller, CodeReader, SiteAdapter } from './base';
 
 const SUBMIT_RESULT_TIMEOUT_MS = 10_000;
+const PAGE_ANSWER_TIMEOUT_MS = 3_000;
+const VIDEO_COMPLETION_OFFSET_SECONDS = 3;
 const VIDEO_METADATA_TIMEOUT_MS = 10_000;
 const VIDEO_SEEK_TIMEOUT_MS = 10_000;
+const VIDEO_PLAYBACK_TIMEOUT_PADDING_MS = 10_000;
 const NEXT_NAVIGATION_FALLBACK_MS = 300;
 const PROJECT_FILE_SWITCH_TIMEOUT_MS = 3_000;
 const nextItemClicked = new WeakMap<Document, symbol>();
@@ -96,6 +99,83 @@ function seekVideoToEnd(video: HTMLVideoElement, duration: number): Promise<void
   });
 }
 
+function waitForVideoPlaybackEnd(video: HTMLVideoElement, duration: number): Promise<void> {
+  if (video.ended) return Promise.resolve();
+
+  const remainingSeconds = Math.max(0, duration - video.currentTime);
+  const playbackRate = Number.isFinite(video.playbackRate) && video.playbackRate > 0
+    ? video.playbackRate
+    : 1;
+  const timeoutMs = Math.max(
+    VIDEO_SEEK_TIMEOUT_MS,
+    Math.ceil((remainingSeconds / playbackRate) * 1000) + VIDEO_PLAYBACK_TIMEOUT_PADDING_MS
+  );
+
+  return new Promise((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout>;
+    let settled = false;
+    let restoreMuted: (() => void) | undefined;
+
+    const restoreAudioState = (): void => {
+      restoreMuted?.();
+      restoreMuted = undefined;
+    };
+
+    const cleanup = (): void => {
+      video.removeEventListener('ended', handleEnded);
+      video.removeEventListener('error', handleError);
+      clearTimeout(timer);
+      restoreAudioState();
+    };
+    const handleEnded = (): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve();
+    };
+    const handleError = (): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(appError('VIDEO_ACTION_FAILED', '视频播放失败，未自动进入下一项'));
+    };
+
+    video.addEventListener('ended', handleEnded);
+    video.addEventListener('error', handleError);
+    timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(appError('VIDEO_ACTION_FAILED', '视频未播放完成，未自动进入下一项'));
+    }, timeoutMs);
+
+    const startPlayback = async (): Promise<void> => {
+      try {
+        await video.play();
+        return;
+      } catch {
+        if (settled) return;
+      }
+
+      const wasMuted = video.muted;
+      video.muted = true;
+      try {
+        await video.play();
+      } catch {
+        video.muted = wasMuted;
+        throw new Error('muted playback was rejected');
+      }
+      if (settled) {
+        video.muted = wasMuted;
+        return;
+      }
+      restoreMuted = () => { video.muted = wasMuted; };
+    };
+
+    void startPlayback().catch(() => handleError());
+  });
+}
+
 function findNextVideoControl(document: Document): HTMLElement | null {
   const nextLink = Array.from(
     document.querySelectorAll<HTMLElement>('.lesson-footer-nav a, .lesson-footer-nav button')
@@ -124,23 +204,25 @@ function isVisible(element: Element, view: Window | null): boolean {
   return true;
 }
 
-function findNextItemButton(document: Document): HTMLButtonElement | null {
+function findSuccessfulSubmissionDialogs(document: Document): HTMLElement[] {
   const view = document.defaultView;
-  const resultWrappers = Array.from(
+  return Array.from(
     document.querySelectorAll<HTMLElement>('.el-dialog__body, [role="dialog"], .el-overlay-dialog')
-  );
-
-  for (const wrapper of resultWrappers) {
+  ).filter((wrapper) => {
     const hasSuccessMarker = wrapper.querySelector(
       '.submit-result-wrap, .success-header, .fa-check-circle, .fa-check, [class*="success"]'
     ) !== null || /(?:回答正确|全部通过|恭喜)/.test(textOf(wrapper));
-    if (!hasSuccessMarker || !isVisible(wrapper, view)) continue;
+    return hasSuccessMarker && isVisible(wrapper, view);
+  });
+}
 
+function findNextItemButton(resultWrappers: HTMLElement[]): HTMLButtonElement | null {
+  for (const wrapper of resultWrappers) {
     const nextButton = Array.from(
       wrapper.querySelectorAll<HTMLButtonElement>('button')
     ).find((button) => textOf(button).includes('下一项')
       && !button.matches(':disabled, [aria-disabled="true"]'));
-    if (nextButton && isVisible(nextButton, view)) return nextButton;
+    if (nextButton && isVisible(nextButton, wrapper.ownerDocument.defaultView)) return nextButton;
   }
 
   return null;
@@ -251,9 +333,10 @@ function waitForSubmissionOutcome(document: Document): Promise<SubmissionOutcome
 
 function findSubmissionNextControl(document: Document): HTMLElement | null {
   if (hasSubmissionFailure(document)) return null;
-  const dialogButton = findNextItemButton(document);
+  const successDialogs = findSuccessfulSubmissionDialogs(document);
+  const dialogButton = findNextItemButton(successDialogs);
   if (dialogButton) return dialogButton;
-  return hasInlineSubmissionResult(document) || hasProjectSubmissionResult(document)
+  return successDialogs.length > 0 || hasInlineSubmissionResult(document) || hasProjectSubmissionResult(document)
     ? findNextVideoControl(document) ?? findHeaderNextControl(document)
     : null;
 }
@@ -620,6 +703,118 @@ function choiceSelectionMode(
     : 'single';
 }
 
+function currentExercise(document: Document): HTMLElement | null {
+  const view = document.defaultView;
+  return Array.from(document.querySelectorAll<HTMLElement>('.exercise'))
+    .find((exercise) => isVisible(exercise, view)) ?? null;
+}
+
+function findPageAnswerButton(exercise: HTMLElement): HTMLButtonElement | null {
+  const view = exercise.ownerDocument.defaultView;
+  return Array.from(exercise.querySelectorAll<HTMLButtonElement>('button'))
+    .find((button) => textOf(button).includes('查看答案')
+      && !button.matches(':disabled, [aria-disabled="true"]')
+      && isVisible(button, view)) ?? null;
+}
+
+function findPageAnswerSolution(exercise: HTMLElement): HTMLElement | null {
+  const view = exercise.ownerDocument.defaultView;
+  return Array.from(exercise.querySelectorAll<HTMLElement>(
+    '.explain-and-solution .exercise-solution'
+  )).find((solution) => textOf(solution.querySelector('h3')) === '答案'
+    && isVisible(solution, view)) ?? null;
+}
+
+function pageAnswerValues(solution: HTMLElement): string[] {
+  const caption = solution.querySelector('.explain-caption');
+  const content = caption?.nextElementSibling ?? solution;
+  const leaves = content.children.length === 0
+    ? [content]
+    : Array.from(content.querySelectorAll<HTMLElement>('*'))
+      .filter((element) => element.children.length === 0
+        && !element.matches('button, script, style'));
+  const values = leaves.map((element) => textOf(element)).filter(Boolean);
+  return values.length > 0 ? values : [textOf(content)].filter(Boolean);
+}
+
+function normalizeAnswerText(value: string): string {
+  return value.replace(/\s+/g, '');
+}
+
+function parseChoiceValue(value: string, options: ChoiceOption[]): string | null {
+  const normalizedValue = normalizeAnswerText(value);
+  const exactOption = options.find((option) => (
+    normalizeAnswerText(option.text) === normalizedValue
+  ));
+  if (exactOption) return exactOption.key.toUpperCase();
+
+  const keyMatch = value.trim().match(/^(?:选项\s*)?([A-Za-z])(?:[.．、:：\s]+(.*))?$/);
+  if (!keyMatch) return null;
+  const key = keyMatch[1].toUpperCase();
+  const option = options.find((candidate) => candidate.key.toUpperCase() === key);
+  if (!option) return null;
+
+  const optionText = keyMatch[2]?.trim();
+  return optionText === undefined || normalizeAnswerText(optionText) === normalizeAnswerText(option.text)
+    ? key
+    : null;
+}
+
+function splitPageAnswer(value: string): string[] {
+  return value.split(/[\r\n,，;；、]+/).map((item) => item.trim()).filter(Boolean);
+}
+
+function parsePageChoiceAnswer(
+  solution: HTMLElement,
+  question: Question
+): AIAnswer | null {
+  if (question.type !== 'choice') return null;
+  const options = question.options ?? [];
+  const rawValues = pageAnswerValues(solution);
+  if (options.length === 0 || rawValues.length === 0) return null;
+
+  let selections = rawValues.map((value) => parseChoiceValue(value, options));
+  if (selections.some((selection) => selection === null) && rawValues.length === 1) {
+    selections = splitPageAnswer(rawValues[0]).map((value) => parseChoiceValue(value, options));
+  }
+  if (selections.some((selection) => selection === null)) return null;
+
+  const uniqueSelections = [...new Set(selections as string[])];
+  if (question.selectionMode === 'single' && uniqueSelections.length !== 1) return null;
+  if (uniqueSelections.length === 0) return null;
+  return { type: 'choice', selections: uniqueSelections };
+}
+
+function parsePageFillAnswer(
+  solution: HTMLElement,
+  question: Question
+): AIAnswer | null {
+  if (question.type !== 'fill') return null;
+  const blankCount = question.blankCount;
+  if (typeof blankCount !== 'number' || !Number.isInteger(blankCount) || blankCount <= 0) return null;
+
+  const rawValues = pageAnswerValues(solution);
+  if (rawValues.length === blankCount) {
+    return { type: 'fill', values: rawValues };
+  }
+  if (rawValues.length !== 1 || blankCount <= 1) return null;
+
+  const value = rawValues[0].replace(/^答案\s*[:：]\s*/, '');
+  const splitValues = splitPageAnswer(value);
+  return splitValues.length === blankCount
+    ? { type: 'fill', values: splitValues }
+    : null;
+}
+
+function parsePageAnswer(
+  solution: HTMLElement,
+  question: Question
+): AIAnswer | null {
+  return question.type === 'choice'
+    ? parsePageChoiceAnswer(solution, question)
+    : parsePageFillAnswer(solution, question);
+}
+
 function findSubmitButton(document: Document): HTMLButtonElement | null {
   const programmingButton = document.querySelector<HTMLButtonElement>('.submit-btn button');
   if (programmingButton) return programmingButton;
@@ -814,6 +1009,66 @@ export class AlphaCodingAdapter implements SiteAdapter {
       ...(examples ? { examples } : {}),
       ...(editorCode ? { editorCode } : {})
     };
+  }
+
+  async extractAnswer(): Promise<AIAnswer | null> {
+    const question = this.extractQuestion();
+    if (!question || (question.type !== 'choice' && question.type !== 'fill')) return null;
+
+    const exercise = currentExercise(this.document);
+    if (!exercise) return null;
+
+    const parse = (solution: HTMLElement): AIAnswer | null => {
+      if (question.type !== 'choice' && question.type !== 'fill') return null;
+      return parsePageAnswer(solution, question);
+    };
+    const existingSolution = findPageAnswerSolution(exercise);
+    if (existingSolution) return parse(existingSolution);
+
+    const button = findPageAnswerButton(exercise);
+    const MutationObserverConstructor = this.document.defaultView?.MutationObserver;
+    const root = this.document.body ?? this.document.documentElement;
+    if (!button || !MutationObserverConstructor || !root) return null;
+
+    return new Promise((resolve) => {
+      let observer: MutationObserver | undefined;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let settled = false;
+
+      const cleanup = (): void => {
+        observer?.disconnect();
+        if (timer !== undefined) clearTimeout(timer);
+      };
+      const finish = (answer: AIAnswer | null): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(answer);
+      };
+      const inspect = (): void => {
+        const solution = findPageAnswerSolution(exercise);
+        if (!solution) return;
+        const values = pageAnswerValues(solution);
+        if (values.length === 0) return;
+        finish(parse(solution));
+      };
+
+      observer = new MutationObserverConstructor(inspect);
+      observer.observe(root, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+        attributes: true
+      });
+      timer = setTimeout(() => finish(null), PAGE_ANSWER_TIMEOUT_MS);
+      try {
+        button.click();
+      } catch {
+        finish(null);
+        return;
+      }
+      inspect();
+    });
   }
 
   async extractQuestionAsync(): Promise<Question | null> {
@@ -1038,7 +1293,8 @@ export class AlphaCodingAdapter implements SiteAdapter {
     if (!video) throw appError('VIDEO_ACTION_FAILED', '未找到视频元素');
 
     const duration = await waitForVideoDuration(video);
-    await seekVideoToEnd(video, duration);
+    await seekVideoToEnd(video, Math.max(0, duration - VIDEO_COMPLETION_OFFSET_SECONDS));
+    await waitForVideoPlaybackEnd(video, duration);
 
     const nextControl = findNextVideoControl(this.document);
     if (!nextControl) throw appError('VIDEO_ACTION_FAILED', '未找到视频页面的下一项按钮');

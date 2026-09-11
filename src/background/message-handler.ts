@@ -90,6 +90,7 @@ export function createMessageHandler(dependencies: MessageHandlerDependencies) {
     controller: AbortController;
     tabId: number;
   }>();
+  const activeSolvePromises = new Map<string, Promise<SolveResult>>();
 
   return async (message: ExtensionMessage, _sender: unknown): Promise<unknown> => {
     if (message.type === 'GET_PAGE_CONTEXT') {
@@ -184,70 +185,161 @@ export function createMessageHandler(dependencies: MessageHandlerDependencies) {
       return { filled: false, error } satisfies SolveResult;
     }
 
+    const solveKey = questionKey === undefined ? undefined : `${tabId}:${questionKey}`;
+    const existingSolve = solveKey === undefined ? undefined : activeSolvePromises.get(solveKey);
+    if (existingSolve) return existingSolve;
+
     const operation = { controller: new AbortController(), tabId };
     activeSolves.add(operation);
 
-    try {
-      notifyCorrelated(dependencies, { type: 'STATUS', status: 'requesting' }, questionKey);
-      const config = await dependencies.getConfig();
-      let question = message.question;
-      if (question.type === 'project') {
-        const rawContext = await dependencies.sendToTab(tabId, { type: 'GET_PAGE_CONTEXT' });
-        if (!isExtensionMessage(rawContext)
-          || rawContext.type !== 'PAGE_CONTEXT'
-          || rawContext.data.question?.type !== 'project') {
-          throw appError('QUESTION_NOT_FOUND', '无法读取项目中的全部文件');
+    const solvePromise = (async (): Promise<SolveResult> => {
+      try {
+        const config = await dependencies.getConfig();
+        const answerMode = config.answerMode ?? 'hybrid';
+        const pageAnswerEligible = answerMode !== 'ai'
+          && (message.question.type === 'choice' || message.question.type === 'fill');
+        let aiStatusSent = false;
+        const notifyAIRequest = (): void => {
+          if (aiStatusSent) return;
+          aiStatusSent = true;
+          notifyCorrelated(dependencies, { type: 'STATUS', status: 'requesting' }, questionKey);
+        };
+
+        if (pageAnswerEligible || answerMode === 'page') {
+          notifyCorrelated(
+            dependencies,
+            { type: 'STATUS', status: 'requesting', phase: 'page-answer' },
+            questionKey
+          );
+        } else {
+          notifyAIRequest();
         }
-        question = rawContext.data.question;
-      }
-      const answer = await dependencies.askAI(
-        question,
-        config,
-        operation.controller.signal
-      );
-      if (operation.controller.signal.aborted) {
-        return { filled: false, cancelled: true } satisfies SolveResult;
-      }
 
-      notifyCorrelated(dependencies, { type: 'AI_RESULT', answer }, questionKey);
-      notifyCorrelated(dependencies, { type: 'STATUS', status: 'filling' }, questionKey);
+        let question = message.question;
+        let answer: AIAnswer | undefined;
+        let answerSource: 'page' | 'ai' = 'ai';
 
-      if (operation.controller.signal.aborted) {
-        return { filled: false, cancelled: true } satisfies SolveResult;
-      }
-      const rawFillResult = await dependencies.sendToTab(tabId, {
-        type: 'FILL_ANSWER',
-        answer,
-        autoSubmit: config.autoSubmit
-      });
-      if (operation.controller.signal.aborted) {
-        return { answer, filled: false, cancelled: true } satisfies SolveResult;
-      }
-      const fillResult = isFillResult(rawFillResult)
-        ? rawFillResult
-        : { success: false, error: undefined };
+        if (pageAnswerEligible) {
+          try {
+            const rawPageAnswer = await dependencies.sendToTab(tabId, { type: 'GET_PAGE_ANSWER' });
+            if (isExtensionMessage(rawPageAnswer)
+              && rawPageAnswer.type === 'PAGE_ANSWER'
+              && rawPageAnswer.answer
+              && rawPageAnswer.answer.type === question.type) {
+              answer = rawPageAnswer.answer;
+              answerSource = 'page';
+            }
+          } catch {
+            // The page answer is an optimization; unavailable content falls back to AI.
+          }
+        }
 
-      if (!fillResult.success) {
-        const error = fillResult.error ?? appError('EDITOR_WRITE_FAILED', '写入编辑器失败');
-        notifyCorrelated(dependencies, { type: 'STATUS', status: 'error', error }, questionKey);
-        return { answer, filled: false, error } satisfies SolveResult;
-      }
+        if (operation.controller.signal.aborted) {
+          return { filled: false, cancelled: true } satisfies SolveResult;
+        }
 
-      notifyCorrelated(dependencies, { type: 'STATUS', status: 'complete' }, questionKey);
-      return { answer, filled: true } satisfies SolveResult;
-    } catch (error) {
-      if (operation.controller.signal.aborted) {
-        return { filled: false, cancelled: true } satisfies SolveResult;
+        if (!answer && answerMode === 'page') {
+          throw appError('QUESTION_NOT_FOUND', '未读取到有效的页面答案，已暂停，请人工检查');
+        }
+
+        if (!answer) {
+          if (question.type === 'project') {
+            const rawContext = await dependencies.sendToTab(tabId, { type: 'GET_PAGE_CONTEXT' });
+            if (!isExtensionMessage(rawContext)
+              || rawContext.type !== 'PAGE_CONTEXT'
+              || rawContext.data.question?.type !== 'project') {
+              throw appError('QUESTION_NOT_FOUND', '无法读取项目中的全部文件');
+            }
+            question = rawContext.data.question;
+          }
+          notifyAIRequest();
+          answer = await dependencies.askAI(
+            question,
+            config,
+            operation.controller.signal
+          );
+        }
+        if (operation.controller.signal.aborted) {
+          return { filled: false, cancelled: true } satisfies SolveResult;
+        }
+
+        notifyCorrelated(dependencies, {
+          type: 'AI_RESULT',
+          answer,
+          ...(answerSource === 'page' ? { source: 'page' as const } : {})
+        }, questionKey);
+        notifyCorrelated(dependencies, { type: 'STATUS', status: 'filling' }, questionKey);
+
+        const fillAnswer = async (candidate: AIAnswer): Promise<
+          { success: boolean; error?: AppError } | null
+        > => {
+          if (operation.controller.signal.aborted) return null;
+          const rawFillResult = await dependencies.sendToTab(tabId, {
+            type: 'FILL_ANSWER',
+            answer: candidate,
+            autoSubmit: config.autoSubmit
+          });
+          if (operation.controller.signal.aborted) return null;
+          return isFillResult(rawFillResult)
+            ? rawFillResult
+            : { success: false, error: undefined };
+        };
+
+        let fillResult = await fillAnswer(answer);
+        if (fillResult === null) {
+          return { answer, filled: false, cancelled: true } satisfies SolveResult;
+        }
+
+        if (!fillResult.success && answerMode === 'hybrid' && answerSource === 'page'
+          && fillResult.error?.code === 'SUBMIT_FAILED') {
+          answerSource = 'ai';
+          notifyAIRequest();
+          answer = await dependencies.askAI(
+            question,
+            config,
+            operation.controller.signal
+          );
+          if (operation.controller.signal.aborted) {
+            return { filled: false, cancelled: true } satisfies SolveResult;
+          }
+          notifyCorrelated(dependencies, { type: 'AI_RESULT', answer }, questionKey);
+          notifyCorrelated(dependencies, { type: 'STATUS', status: 'filling' }, questionKey);
+          fillResult = await fillAnswer(answer);
+          if (fillResult === null) {
+            return { answer, filled: false, cancelled: true } satisfies SolveResult;
+          }
+        }
+
+        if (!fillResult.success) {
+          const error = fillResult.error ?? appError('EDITOR_WRITE_FAILED', '写入编辑器失败');
+          notifyCorrelated(dependencies, { type: 'STATUS', status: 'error', error }, questionKey);
+          return { answer, filled: false, error } satisfies SolveResult;
+        }
+
+        notifyCorrelated(dependencies, { type: 'STATUS', status: 'complete' }, questionKey);
+        return { answer, filled: true } satisfies SolveResult;
+      } catch (error) {
+        if (operation.controller.signal.aborted) {
+          return { filled: false, cancelled: true } satisfies SolveResult;
+        }
+        const appErrorValue = toAppError(error, 'AI 解答失败');
+        notifyCorrelated(
+          dependencies,
+          { type: 'STATUS', status: 'error', error: appErrorValue },
+          questionKey
+        );
+        return { filled: false, error: appErrorValue } satisfies SolveResult;
+      } finally {
+        activeSolves.delete(operation);
       }
-      const appErrorValue = toAppError(error, 'AI 解答失败');
-      notifyCorrelated(
-        dependencies,
-        { type: 'STATUS', status: 'error', error: appErrorValue },
-        questionKey
-      );
-      return { filled: false, error: appErrorValue } satisfies SolveResult;
-    } finally {
-      activeSolves.delete(operation);
-    }
+    })();
+
+    if (solveKey === undefined) return solvePromise;
+    activeSolvePromises.set(solveKey, solvePromise);
+    return solvePromise.finally(() => {
+      if (activeSolvePromises.get(solveKey) === solvePromise) {
+        activeSolvePromises.delete(solveKey);
+      }
+    });
   };
 }

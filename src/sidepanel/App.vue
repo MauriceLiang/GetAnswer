@@ -1,8 +1,20 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
-import { loadConfig, saveConfig, DEFAULT_CONFIG } from '../background/config';
+import {
+  DEFAULT_CONFIG,
+  loadConfig,
+  saveAnswerMode,
+  saveConfig
+} from '../background/config';
 import { isExtensionMessage } from '../shared/messages';
-import type { AIAnswer, AIConfig, PageContext, Question, TaskStatus } from '../shared/types';
+import type {
+  AIAnswer,
+  AIConfig,
+  AnswerMode,
+  PageContext,
+  Question,
+  TaskStatus
+} from '../shared/types';
 import { MODEL_PRESETS } from './model-presets';
 
 const emptyPageContext: PageContext = {
@@ -18,6 +30,7 @@ const status = ref<TaskStatus>('idle');
 const statusText = ref('等待识别页面');
 const errorMessage = ref('');
 const answerText = ref('');
+const answerSource = ref<'page' | 'ai'>('ai');
 const showConfigModal = ref(false);
 const connectionMessage = ref('');
 const connectionMessageType = ref<'success' | 'error' | ''>('');
@@ -32,6 +45,28 @@ let solveGeneration = 0;
 let autoSolveInFlight = false;
 let autoAdvanceVideoInFlight = false;
 
+const answerModeOptions: Array<{
+  value: AnswerMode;
+  label: string;
+  description: string;
+}> = [
+  {
+    value: 'page',
+    label: '仅抓取答案',
+    description: '只使用页面上的标准答案，失败后暂停人工处理。'
+  },
+  {
+    value: 'ai',
+    label: '仅使用 AI',
+    description: '跳过页面答案，完全交给 AI 解答。'
+  },
+  {
+    value: 'hybrid',
+    label: '抓取 + AI 兜底',
+    description: '优先使用页面答案，读取失败或提交错误时调用一次 AI。'
+  }
+];
+
 const question = computed(() => pageContext.value.question);
 const isSolving = computed(() => status.value === 'requesting' || status.value === 'filling');
 const canSolve = computed(() => pageContext.value.supported
@@ -40,6 +75,14 @@ const canSolve = computed(() => pageContext.value.supported
     || question.value?.type === 'choice'
     || question.value?.type === 'fill')
   && !isSolving.value);
+const answerModeLabel = computed(() => answerModeOptions.find((item) => (
+  item.value === config.value.answerMode
+))?.label ?? '抓取 + AI 兜底');
+const solveButtonText = computed(() => {
+  if (config.value.answerMode === 'page') return '抓取答案并填写';
+  if (config.value.answerMode === 'ai') return 'AI 解答并填写';
+  return '抓取/AI 并填写';
+});
 const selectedModelPreset = computed({
   get(): string {
     return MODEL_PRESETS.find((preset) => (
@@ -146,7 +189,10 @@ function applyPageContext(context: PageContext): void {
 
   pageContext.value = context;
   errorMessage.value = '';
-  if (questionChanged) answerText.value = '';
+  if (questionChanged) {
+    answerText.value = '';
+    answerSource.value = 'ai';
+  }
   if (context.supported && context.question) {
     autoAdvanceVideoKey.value = null;
     const stoppedCurrentQuestion = stoppedQuestionKeys.has(nextQuestionKey ?? '');
@@ -180,13 +226,14 @@ const handleMessage = (message: unknown): void => {
   } else if (message.type === 'AI_RESULT') {
     if (!isMessageForCurrentQuestion(message.questionKey)) return;
     answerText.value = formatAnswer(message.answer);
+    answerSource.value = message.source ?? 'ai';
   } else if (message.type === 'STATUS') {
     if (!isMessageForCurrentQuestion(message.questionKey)) return;
     status.value = message.status;
     if (message.error) {
       setError(message.error.message);
     } else if (message.status === 'requesting') {
-      statusText.value = '正在调用 AI';
+      statusText.value = message.phase === 'page-answer' ? '正在读取页面答案' : '正在调用 AI';
       errorMessage.value = '';
     } else if (message.status === 'filling') {
       statusText.value = '正在填写答案';
@@ -231,6 +278,7 @@ async function startAutoAnswer(): Promise<void> {
   stoppedQuestionKeys.clear();
   autoSolveQuestionKey.value = null;
   answerText.value = '';
+  answerSource.value = 'ai';
   status.value = 'scanning';
   statusText.value = '正在刷新页面';
   errorMessage.value = '';
@@ -282,6 +330,16 @@ async function stopAutoAnswer(): Promise<void> {
 
 async function loadStoredConfig(): Promise<void> {
   config.value = await loadConfig(chrome.storage.local);
+}
+
+async function handleAnswerModeChange(): Promise<void> {
+  try {
+    await saveAnswerMode(chrome.storage.local, config.value.answerMode);
+    errorMessage.value = '';
+    statusText.value = `已切换为${answerModeLabel.value}`;
+  } catch (error) {
+    setError(error instanceof Error ? error.message : '答题模式保存失败');
+  }
 }
 
 async function saveStoredConfig(): Promise<void> {
@@ -388,7 +446,11 @@ async function solve(): Promise<void> {
   stoppedQuestionKeys.delete(currentQuestionKey);
 
   status.value = 'requesting';
-  statusText.value = '正在调用 AI';
+  statusText.value = config.value.answerMode === 'page'
+    || (config.value.answerMode === 'hybrid'
+      && (currentQuestion.type === 'choice' || currentQuestion.type === 'fill'))
+    ? '正在读取页面答案'
+    : '正在调用 AI';
   errorMessage.value = '';
 
   try {
@@ -451,6 +513,7 @@ onBeforeUnmount(() => {
       </div>
       <button
         type="button"
+        v-if="config.answerMode !== 'page'"
         class="secondary settings-button"
         aria-label="打开模型配置"
         @click="showConfigModal = true"
@@ -473,6 +536,25 @@ onBeforeUnmount(() => {
           {{ option.key }}. {{ option.text }}
         </li>
       </ul>
+    </section>
+
+    <section class="answer-mode-card">
+      <h2>答题模式</h2>
+      <div class="answer-mode-options">
+        <label v-for="option in answerModeOptions" :key="option.value" class="answer-mode-option">
+          <input
+            v-model="config.answerMode"
+            type="radio"
+            name="answer-mode"
+            :value="option.value"
+            @change="handleAnswerModeChange"
+          />
+          <span>
+            <strong>{{ option.label }}</strong>
+            <small>{{ option.description }}</small>
+          </span>
+        </label>
+      </div>
     </section>
 
     <div
@@ -512,7 +594,7 @@ onBeforeUnmount(() => {
           <input v-model="config.autoSolve" name="auto-solve" type="checkbox" />
           识别题目后自动解答
         </label>
-        <p class="setting-hint">开启后，识别到编程题、综合项目或选择题会自动调用 AI 并填写答案。</p>
+        <p class="setting-hint">开启后，识别到支持的题目会按当前答题模式自动处理。</p>
         <label class="checkbox-label">
           <input v-model="config.autoAdvanceVideo" name="auto-advance-video" type="checkbox" />
           视频完成后自动进入下一项
@@ -550,12 +632,12 @@ onBeforeUnmount(() => {
       >{{ isStartingAnswer ? '刷新中…' : '开始答题' }}</button>
       <button type="button" class="stop-answer" @click="stopAutoAnswer">停止答题</button>
       <button type="button" class="secondary" @click="refresh">重新识别</button>
-      <button type="button" class="solve" :disabled="!canSolve" @click="solve">AI 解答并填写</button>
+      <button type="button" class="solve" :disabled="!canSolve" @click="solve">{{ solveButtonText }}</button>
     </section>
 
     <p v-if="errorMessage" class="error" role="alert">{{ errorMessage }}</p>
     <section v-if="answerText" class="answer-card">
-      <h2>AI 答案</h2>
+      <h2>{{ answerSource === 'page' ? '页面答案' : 'AI 答案' }}</h2>
       <pre><code>{{ answerText }}</code></pre>
     </section>
   </main>
@@ -570,10 +652,16 @@ h2 { margin: 8px 0; font-size: 15px; }
 .status-error, .error { color: #b91c1c; }
 section { margin-bottom: 16px; }
 .question-card, .config-card, .answer-card { padding: 12px; border: 1px solid #e5e7eb; border-radius: 8px; }
+.answer-mode-card { padding: 12px; border: 1px solid #e5e7eb; border-radius: 8px; }
 .question-content { white-space: pre-wrap; max-height: 240px; overflow: auto; }
 .choice-options { margin: 8px 0 0; padding-left: 20px; }
 label { display: block; margin: 8px 0; }
 input, select { box-sizing: border-box; display: block; width: 100%; margin-top: 4px; padding: 6px 8px; }
+.answer-mode-options { display: grid; gap: 8px; }
+.answer-mode-option { display: flex; align-items: flex-start; gap: 8px; margin: 0; }
+.answer-mode-option input { display: inline-block; flex: 0 0 auto; width: auto; margin: 3px 0 0; }
+.answer-mode-option span { display: grid; gap: 2px; }
+.answer-mode-option small { color: #6b7280; font-size: 12px; }
 .checkbox-label { display: flex; align-items: center; gap: 8px; }
 .checkbox-label input { display: inline-block; width: auto; margin: 0; }
 .setting-hint { margin: -4px 0 8px; color: #6b7280; font-size: 12px; }

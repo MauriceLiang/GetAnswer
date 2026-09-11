@@ -1,4 +1,4 @@
-import type { AIConfig } from '../shared/types';
+import type { AIConfig, AnswerMode } from '../shared/types';
 import { appError } from '../shared/errors';
 
 export interface ConfigStorage {
@@ -7,6 +7,7 @@ export interface ConfigStorage {
 }
 
 export const DEFAULT_CONFIG: AIConfig = {
+  answerMode: 'hybrid',
   baseUrl: '',
   apiKey: '',
   model: 'deepseek-chat',
@@ -18,6 +19,7 @@ export const DEFAULT_CONFIG: AIConfig = {
 };
 
 const configKeys = [
+  'answerMode',
   'baseUrl',
   'apiKey',
   'model',
@@ -28,8 +30,15 @@ const configKeys = [
   'autoAdvanceVideo'
 ];
 
+function isAnswerMode(value: unknown): value is AnswerMode {
+  return value === 'page' || value === 'ai' || value === 'hybrid';
+}
+
 function readConfigValue(stored: Record<string, unknown>): AIConfig {
   return {
+    answerMode: isAnswerMode(stored.answerMode)
+      ? stored.answerMode
+      : DEFAULT_CONFIG.answerMode,
     baseUrl: typeof stored.baseUrl === 'string' ? stored.baseUrl : DEFAULT_CONFIG.baseUrl,
     apiKey: typeof stored.apiKey === 'string' ? stored.apiKey : DEFAULT_CONFIG.apiKey,
     model: typeof stored.model === 'string' ? stored.model : DEFAULT_CONFIG.model,
@@ -56,14 +65,21 @@ export async function loadConfig(
 }
 
 export function validateConfig(config: AIConfig): void {
-  if (!config.baseUrl.trim() || !config.apiKey.trim() || !config.model.trim()) {
+  if (!isAnswerMode(config.answerMode)) {
+    throw appError('AI_CONFIG_INVALID', '答题模式无效');
+  }
+
+  if (config.answerMode !== 'page'
+    && (!config.baseUrl.trim() || !config.apiKey.trim() || !config.model.trim())) {
     throw appError('AI_CONFIG_INVALID', 'AI 配置无效：Base URL、API Key 和 Model 不能为空');
   }
 
-  try {
-    new URL(config.baseUrl);
-  } catch {
-    throw appError('AI_CONFIG_INVALID', 'AI 配置无效：Base URL 不是有效地址');
+  if (config.answerMode !== 'page') {
+    try {
+      new URL(config.baseUrl);
+    } catch {
+      throw appError('AI_CONFIG_INVALID', 'AI 配置无效：Base URL 不是有效地址');
+    }
   }
 
   if (!Number.isFinite(config.temperature) || config.temperature < 0) {
@@ -81,6 +97,7 @@ export async function saveConfig(
 ): Promise<void> {
   validateConfig(config);
   await storage.set({
+    answerMode: config.answerMode,
     baseUrl: config.baseUrl,
     apiKey: config.apiKey,
     model: config.model,
@@ -90,4 +107,14 @@ export async function saveConfig(
     autoSolve: config.autoSolve,
     autoAdvanceVideo: config.autoAdvanceVideo
   });
+}
+
+export async function saveAnswerMode(
+  storage: ConfigStorage,
+  answerMode: AnswerMode
+): Promise<void> {
+  if (!isAnswerMode(answerMode)) {
+    throw appError('AI_CONFIG_INVALID', '答题模式无效');
+  }
+  await storage.set({ answerMode });
 }
