@@ -134,6 +134,35 @@ export function createMessageHandler(dependencies: MessageHandlerDependencies) {
       return { type: 'STOP_SOLVING_RESULT', success: true } satisfies ExtensionMessage;
     }
 
+    if (message.type === 'SKIP_INFO_PAGE') {
+      const tabId = await dependencies.getActiveTabId();
+      if (tabId === null) {
+        return {
+          type: 'INFO_PAGE_RESULT',
+          success: false,
+          error: appError('PAGE_NOT_SUPPORTED', '没有可用的活动学习页面')
+        } satisfies ExtensionMessage;
+      }
+
+      try {
+        const rawResult = await dependencies.sendToTab(tabId, message);
+        if (isExtensionMessage(rawResult) && rawResult.type === 'INFO_PAGE_RESULT') {
+          return rawResult;
+        }
+        return {
+          type: 'INFO_PAGE_RESULT',
+          success: false,
+          error: appError('PAGE_NOT_SUPPORTED', '信息页未返回有效结果')
+        } satisfies ExtensionMessage;
+      } catch (error) {
+        return {
+          type: 'INFO_PAGE_RESULT',
+          success: false,
+          error: toAppError(error, '信息页跳过失败', 'PAGE_NOT_SUPPORTED')
+        } satisfies ExtensionMessage;
+      }
+    }
+
     if (message.type === 'TEST_CONNECTION') {
       try {
         const config = await dependencies.getConfig();
@@ -197,7 +226,10 @@ export function createMessageHandler(dependencies: MessageHandlerDependencies) {
         const config = await dependencies.getConfig();
         const answerMode = config.answerMode ?? 'hybrid';
         const pageAnswerEligible = answerMode !== 'ai'
-          && (message.question.type === 'choice' || message.question.type === 'fill');
+          && (message.question.type === 'programming'
+            || message.question.type === 'project'
+            || message.question.type === 'choice'
+            || message.question.type === 'fill');
         let aiStatusSent = false;
         const notifyAIRequest = (): void => {
           if (aiStatusSent) return;
@@ -218,6 +250,16 @@ export function createMessageHandler(dependencies: MessageHandlerDependencies) {
         let question = message.question;
         let answer: AIAnswer | undefined;
         let answerSource: 'page' | 'ai' = 'ai';
+        const refreshProjectQuestion = async (): Promise<void> => {
+          if (question.type !== 'project') return;
+          const rawContext = await dependencies.sendToTab(tabId, { type: 'GET_PAGE_CONTEXT' });
+          if (!isExtensionMessage(rawContext)
+            || rawContext.type !== 'PAGE_CONTEXT'
+            || rawContext.data.question?.type !== 'project') {
+            throw appError('QUESTION_NOT_FOUND', '无法读取项目中的全部文件');
+          }
+          question = rawContext.data.question;
+        };
 
         if (pageAnswerEligible) {
           try {
@@ -243,15 +285,7 @@ export function createMessageHandler(dependencies: MessageHandlerDependencies) {
         }
 
         if (!answer) {
-          if (question.type === 'project') {
-            const rawContext = await dependencies.sendToTab(tabId, { type: 'GET_PAGE_CONTEXT' });
-            if (!isExtensionMessage(rawContext)
-              || rawContext.type !== 'PAGE_CONTEXT'
-              || rawContext.data.question?.type !== 'project') {
-              throw appError('QUESTION_NOT_FOUND', '无法读取项目中的全部文件');
-            }
-            question = rawContext.data.question;
-          }
+          await refreshProjectQuestion();
           notifyAIRequest();
           answer = await dependencies.askAI(
             question,
@@ -277,7 +311,8 @@ export function createMessageHandler(dependencies: MessageHandlerDependencies) {
           const rawFillResult = await dependencies.sendToTab(tabId, {
             type: 'FILL_ANSWER',
             answer: candidate,
-            autoSubmit: config.autoSubmit
+            autoSubmit: config.autoSubmit,
+            ...(answerSource === 'page' ? { source: 'page' as const } : {})
           });
           if (operation.controller.signal.aborted) return null;
           return isFillResult(rawFillResult)
@@ -293,6 +328,7 @@ export function createMessageHandler(dependencies: MessageHandlerDependencies) {
         if (!fillResult.success && answerMode === 'hybrid' && answerSource === 'page'
           && fillResult.error?.code === 'SUBMIT_FAILED') {
           answerSource = 'ai';
+          await refreshProjectQuestion();
           notifyAIRequest();
           answer = await dependencies.askAI(
             question,

@@ -29,6 +29,7 @@ export function scanPage(
   }
 
   const question = adapter.extractQuestion() ?? undefined;
+  const isInformationalPage = adapter.isInformationalPage?.() === true;
   const supportsVideo = pageFlags.hasVideo && adapter.completeVideo !== undefined;
   return {
     adapter: adapter.name,
@@ -38,6 +39,7 @@ export function scanPage(
       || question?.type === 'fill'
       || supportsVideo,
     ...(question ? { question } : {}),
+    ...(isInformationalPage ? { isInformationalPage: true } : {}),
     ...pageFlags
   };
 }

@@ -44,6 +44,7 @@ const stoppedQuestionKeys = new Set<string>();
 let solveGeneration = 0;
 let autoSolveInFlight = false;
 let autoAdvanceVideoInFlight = false;
+let skipInfoPageInFlight = false;
 
 const answerModeOptions: Array<{
   value: AnswerMode;
@@ -210,12 +211,55 @@ function applyPageContext(context: PageContext): void {
       statusText.value = '已识别视频';
     }
     maybeAutoAdvanceVideo(context);
+  } else if (context.isInformationalPage) {
+    autoSolveQuestionKey.value = null;
+    autoAdvanceVideoKey.value = null;
+    if (!skipInfoPageInFlight) {
+      status.value = 'idle';
+      statusText.value = '信息页，准备进入下一项';
+    }
+    maybeSkipInformationalPage(context);
   } else {
     autoSolveQuestionKey.value = null;
     autoAdvanceVideoKey.value = null;
     status.value = 'error';
     statusText.value = '当前页面暂不支持';
   }
+}
+
+function maybeSkipInformationalPage(context: PageContext): void {
+  if (!context.isInformationalPage
+    || (!config.value.autoSolve && !autoAnswerRunning.value)
+    || skipInfoPageInFlight) {
+    return;
+  }
+
+  skipInfoPageInFlight = true;
+  const generation = solveGeneration;
+  status.value = 'filling';
+  statusText.value = '正在跳过信息页';
+  errorMessage.value = '';
+
+  void chrome.runtime.sendMessage({ type: 'SKIP_INFO_PAGE' })
+    .then((response: unknown) => {
+      if (generation !== solveGeneration) return;
+      if (!isExtensionMessage(response) || response.type !== 'INFO_PAGE_RESULT') {
+        setError('未收到有效的信息页处理结果');
+        return;
+      }
+      if (!response.success) {
+        setError(response.error?.message ?? '信息页跳过失败');
+        return;
+      }
+      status.value = 'complete';
+      statusText.value = '信息页已跳过，正在进入下一项';
+    })
+    .catch(() => {
+      if (generation === solveGeneration) setError('信息页处理失败');
+    })
+    .finally(() => {
+      skipInfoPageInFlight = false;
+    });
 }
 
 const handleMessage = (message: unknown): void => {
@@ -357,6 +401,7 @@ async function saveStoredConfig(): Promise<void> {
     } else {
       autoAdvanceVideoKey.value = null;
     }
+    maybeSkipInformationalPage(pageContext.value);
   } catch (error) {
     setError(error instanceof Error ? error.message : '配置保存失败');
   }

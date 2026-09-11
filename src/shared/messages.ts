@@ -19,12 +19,19 @@ export type ExtensionMessage =
   | { type: 'REFRESH_PAGE_RESULT'; success: boolean; error?: AppError }
   | { type: 'STOP_SOLVING' }
   | { type: 'STOP_SOLVING_RESULT'; success: boolean }
+  | { type: 'SKIP_INFO_PAGE' }
+  | { type: 'INFO_PAGE_RESULT'; success: boolean; error?: AppError }
   | { type: 'SOLVE_QUESTION'; question: Question; questionKey?: string }
   | { type: 'TEST_CONNECTION' }
   | { type: 'TEST_CONNECTION_RESULT'; success: boolean; error?: AppError }
   | { type: 'ADVANCE_VIDEO' }
   | { type: 'AI_RESULT'; answer: AIAnswer; questionKey?: string; source?: 'page' | 'ai' }
-  | { type: 'FILL_ANSWER'; answer: AIAnswer; autoSubmit?: boolean }
+  | {
+    type: 'FILL_ANSWER';
+    answer: AIAnswer;
+    autoSubmit?: boolean;
+    source?: 'page' | 'ai';
+  }
   | { type: 'FILL_RESULT'; success: boolean; error?: AppError }
   | { type: 'VIDEO_RESULT'; success: boolean; error?: AppError }
   | {
@@ -186,6 +193,8 @@ function isPageContext(value: unknown): value is PageContext {
     && typeof value.supported === 'boolean'
     && typeof value.hasVideo === 'boolean'
     && typeof value.hasEditor === 'boolean'
+    && (value.isInformationalPage === undefined
+      || typeof value.isInformationalPage === 'boolean')
     && (value.videoSrc === undefined || typeof value.videoSrc === 'string')
     && (value.question === undefined || isQuestion(value.question));
 }
@@ -222,6 +231,11 @@ export function isExtensionMessage(value: unknown): value is ExtensionMessage {
       return true;
     case 'STOP_SOLVING_RESULT':
       return typeof value.success === 'boolean';
+    case 'SKIP_INFO_PAGE':
+      return true;
+    case 'INFO_PAGE_RESULT':
+      return typeof value.success === 'boolean'
+        && (value.error === undefined || isAppError(value.error));
     case 'ADVANCE_VIDEO':
       return true;
     case 'SOLVE_QUESTION':
@@ -238,7 +252,8 @@ export function isExtensionMessage(value: unknown): value is ExtensionMessage {
         && (value.source === undefined || value.source === 'page' || value.source === 'ai');
     case 'FILL_ANSWER':
       return isAIAnswer(value.answer)
-        && (value.autoSubmit === undefined || typeof value.autoSubmit === 'boolean');
+        && (value.autoSubmit === undefined || typeof value.autoSubmit === 'boolean')
+        && (value.source === undefined || value.source === 'page' || value.source === 'ai');
     case 'FILL_RESULT':
       return typeof value.success === 'boolean'
         && (value.error === undefined || isAppError(value.error));

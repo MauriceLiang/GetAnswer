@@ -163,6 +163,30 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === 'SKIP_INFO_PAGE') {
+    const adapter = findAdapter(document, window.location, fillCode);
+    if (!adapter?.skipInformationalPage) {
+      sendResponse({
+        type: 'INFO_PAGE_RESULT',
+        success: false,
+        error: appError('PAGE_NOT_SUPPORTED', '当前页面不是可跳过的信息页')
+      } satisfies ExtensionMessage);
+      return;
+    }
+
+    try {
+      adapter.skipInformationalPage();
+      sendResponse({ type: 'INFO_PAGE_RESULT', success: true } satisfies ExtensionMessage);
+    } catch (error) {
+      sendResponse({
+        type: 'INFO_PAGE_RESULT',
+        success: false,
+        error: toAppError(error, appError('PAGE_NOT_SUPPORTED', '信息页跳过失败'))
+      } satisfies ExtensionMessage);
+    }
+    return;
+  }
+
   if (message.type !== 'FILL_ANSWER') return;
 
   const adapter = findAdapter(document, window.location, fillCode, readCode);
@@ -180,7 +204,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   const projectAnswerFilling = message.answer.type === 'project';
   if (projectAnswerFilling) projectContextCollecting = true;
 
-  void adapter.fillAnswer(message.answer)
+  void adapter.fillAnswer(message.answer, { allowOverwrite: message.source === 'page' })
     .then(async () => {
       if (isStopped()) {
         sendResponse({ type: 'FILL_RESULT', success: false } satisfies ExtensionMessage);
@@ -202,11 +226,32 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       }
       sendResponse({ type: 'FILL_RESULT', success: true } satisfies ExtensionMessage);
     })
-    .catch((error: unknown) => sendResponse({
-      type: 'FILL_RESULT',
-      success: false,
-      error: toAppError(error)
-    } satisfies ExtensionMessage))
+    .catch(async (error: unknown) => {
+      const errorValue = toAppError(error);
+      if (message.source === 'page'
+        && projectAnswerFilling
+        && errorValue.code === 'SUBMIT_FAILED'
+        && adapter.restoreOriginalProjectFiles) {
+        try {
+          await adapter.restoreOriginalProjectFiles();
+        } catch (restoreError) {
+          sendResponse({
+            type: 'FILL_RESULT',
+            success: false,
+            error: toAppError(
+              restoreError,
+              appError('EDITOR_WRITE_FAILED', '官方答案失败后恢复原代码失败，请手动检查')
+            )
+          } satisfies ExtensionMessage);
+          return;
+        }
+      }
+      sendResponse({
+        type: 'FILL_RESULT',
+        success: false,
+        error: errorValue
+      } satisfies ExtensionMessage);
+    })
     .finally(() => {
       if (projectAnswerFilling) projectContextCollecting = false;
     });

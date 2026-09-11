@@ -66,6 +66,7 @@ export interface PageContext {
   adapter: string;
   supported: boolean;
   question?: Question;
+  isInformationalPage?: boolean;
   hasVideo: boolean;
   videoSrc?: string;
   hasEditor: boolean;

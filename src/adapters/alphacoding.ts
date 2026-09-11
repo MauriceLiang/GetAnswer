@@ -13,7 +13,7 @@ import {
   normalizeProjectPath,
   preservesOriginalCode
 } from '../shared/project-files';
-import type { CodeFiller, CodeReader, SiteAdapter } from './base';
+import type { CodeFiller, CodeReader, FillAnswerOptions, SiteAdapter } from './base';
 
 const SUBMIT_RESULT_TIMEOUT_MS = 10_000;
 const PAGE_ANSWER_TIMEOUT_MS = 3_000;
@@ -24,6 +24,7 @@ const VIDEO_PLAYBACK_TIMEOUT_PADDING_MS = 10_000;
 const NEXT_NAVIGATION_FALLBACK_MS = 300;
 const PROJECT_FILE_SWITCH_TIMEOUT_MS = 3_000;
 const nextItemClicked = new WeakMap<Document, symbol>();
+const informationalPageSkipped = new WeakMap<Document, string>();
 let submissionInFlight = false;
 
 const defaultFillCode: CodeFiller = async () => {
@@ -717,6 +718,19 @@ function findPageAnswerButton(exercise: HTMLElement): HTMLButtonElement | null {
       && isVisible(button, view)) ?? null;
 }
 
+function findPageSolutionTab(exercise: HTMLElement): HTMLElement | null {
+  const view = exercise.ownerDocument.defaultView;
+  return Array.from(exercise.querySelectorAll<HTMLElement>(
+    '[role="tab"], .el-tabs__item, button'
+  )).find((tab) => textOf(tab) === '解析'
+    && !tab.matches(':disabled, [aria-disabled="true"]')
+    && isVisible(tab, view)) ?? null;
+}
+
+function isPageTabActive(tab: HTMLElement): boolean {
+  return tab.classList.contains('is-active') || tab.getAttribute('aria-selected') === 'true';
+}
+
 function findPageAnswerSolution(exercise: HTMLElement): HTMLElement | null {
   const view = exercise.ownerDocument.defaultView;
   return Array.from(exercise.querySelectorAll<HTMLElement>(
@@ -728,6 +742,11 @@ function findPageAnswerSolution(exercise: HTMLElement): HTMLElement | null {
 function pageAnswerValues(solution: HTMLElement): string[] {
   const caption = solution.querySelector('.explain-caption');
   const content = caption?.nextElementSibling ?? solution;
+  const listItems = Array.from(content.querySelectorAll<HTMLElement>('ul > li, ol > li'))
+    .map((element) => textOf(element))
+    .filter(Boolean);
+  if (listItems.length > 0) return listItems;
+
   const leaves = content.children.length === 0
     ? [content]
     : Array.from(content.querySelectorAll<HTMLElement>('*'))
@@ -741,14 +760,21 @@ function normalizeAnswerText(value: string): string {
   return value.replace(/\s+/g, '');
 }
 
+function unwrapInlineMarkdownCode(value: string): string {
+  const trimmed = value.trim();
+  const match = trimmed.match(/^`([^`\r\n]+)`$/);
+  return match?.[1].trim() ?? trimmed;
+}
+
 function parseChoiceValue(value: string, options: ChoiceOption[]): string | null {
-  const normalizedValue = normalizeAnswerText(value);
+  const unwrappedValue = unwrapInlineMarkdownCode(value);
+  const normalizedValue = normalizeAnswerText(unwrappedValue);
   const exactOption = options.find((option) => (
     normalizeAnswerText(option.text) === normalizedValue
   ));
   if (exactOption) return exactOption.key.toUpperCase();
 
-  const keyMatch = value.trim().match(/^(?:选项\s*)?([A-Za-z])(?:[.．、:：\s]+(.*))?$/);
+  const keyMatch = unwrappedValue.match(/^(?:选项\s*)?([A-Za-z])(?:[.．、:：\s]+(.*))?$/);
   if (!keyMatch) return null;
   const key = keyMatch[1].toUpperCase();
   const option = options.find((candidate) => candidate.key.toUpperCase() === key);
@@ -806,13 +832,37 @@ function parsePageFillAnswer(
     : null;
 }
 
+function parsePageProgrammingAnswer(solution: HTMLElement): AIAnswer | null {
+  const code = solution.querySelector('pre.code-solution, pre')?.textContent?.trim() ?? '';
+  return code ? { type: 'programming', code } : null;
+}
+
+function parsePageProjectAnswer(solution: HTMLElement): AIAnswer | null {
+  const files = Array.from(solution.querySelectorAll<HTMLElement>('.space-y-1'))
+    .flatMap((fileBlock) => {
+      const path = textOf(fileBlock.querySelector('h3'));
+      const code = fileBlock.querySelector('pre.code-solution, pre')?.textContent?.trim() ?? '';
+      return path && code ? [{ path, code }] : [];
+    });
+  return files.length > 0 ? { type: 'project', files } : null;
+}
+
 function parsePageAnswer(
   solution: HTMLElement,
   question: Question
 ): AIAnswer | null {
-  return question.type === 'choice'
-    ? parsePageChoiceAnswer(solution, question)
-    : parsePageFillAnswer(solution, question);
+  switch (question.type) {
+    case 'choice':
+      return parsePageChoiceAnswer(solution, question);
+    case 'fill':
+      return parsePageFillAnswer(solution, question);
+    case 'programming':
+      return parsePageProgrammingAnswer(solution);
+    case 'project':
+      return parsePageProjectAnswer(solution);
+    default:
+      return null;
+  }
 }
 
 function findSubmitButton(document: Document): HTMLButtonElement | null {
@@ -909,6 +959,7 @@ function clickNextItemButton(
 export class AlphaCodingAdapter implements SiteAdapter {
   name = 'alphacoding';
   private submissionObserver?: MutationObserver;
+  private originalProjectSnapshot?: ProjectFileSnapshot;
 
   constructor(
     private readonly document: Document,
@@ -934,6 +985,28 @@ export class AlphaCodingAdapter implements SiteAdapter {
       return 'choice';
     }
     return 'unknown';
+  }
+
+  isInformationalPage(): boolean {
+    return this.detectQuestionType() === 'unknown'
+      && this.document.querySelector('.fragment-container.page.document') !== null
+      && findNextVideoControl(this.document) !== null;
+  }
+
+  skipInformationalPage(): void {
+    if (!this.isInformationalPage()) {
+      throw appError('PAGE_NOT_SUPPORTED', '当前页面不是可跳过的信息页');
+    }
+
+    const nextControl = findNextVideoControl(this.document);
+    if (!nextControl) {
+      throw appError('PAGE_NOT_SUPPORTED', '信息页没有找到下一项按钮');
+    }
+    const pageKey = navigationKey(this.document, this.location);
+    if (informationalPageSkipped.get(this.document) === pageKey) return;
+    informationalPageSkipped.set(this.document, pageKey);
+    nextItemClicked.delete(this.document);
+    clickNextItemButton(nextControl, this.location, this.navigate);
   }
 
   extractQuestion(): Question | null {
@@ -1013,27 +1086,33 @@ export class AlphaCodingAdapter implements SiteAdapter {
 
   async extractAnswer(): Promise<AIAnswer | null> {
     const question = this.extractQuestion();
-    if (!question || (question.type !== 'choice' && question.type !== 'fill')) return null;
+    if (!question || question.type === 'unknown') return null;
 
     const exercise = currentExercise(this.document);
     if (!exercise) return null;
 
     const parse = (solution: HTMLElement): AIAnswer | null => {
-      if (question.type !== 'choice' && question.type !== 'fill') return null;
       return parsePageAnswer(solution, question);
     };
     const existingSolution = findPageAnswerSolution(exercise);
-    if (existingSolution) return parse(existingSolution);
+    if (existingSolution) {
+      const answer = parse(existingSolution);
+      if (answer) return answer;
+    }
 
-    const button = findPageAnswerButton(exercise);
+    const solutionTab = findPageSolutionTab(exercise);
+    const shouldOpenSolutionTab = solutionTab !== null && !isPageTabActive(solutionTab);
+    const button = shouldOpenSolutionTab ? null : findPageAnswerButton(exercise);
     const MutationObserverConstructor = this.document.defaultView?.MutationObserver;
     const root = this.document.body ?? this.document.documentElement;
-    if (!button || !MutationObserverConstructor || !root) return null;
+    if ((!button && !existingSolution && !shouldOpenSolutionTab)
+      || !MutationObserverConstructor || !root) return null;
 
     return new Promise((resolve) => {
       let observer: MutationObserver | undefined;
       let timer: ReturnType<typeof setTimeout> | undefined;
       let settled = false;
+      let answerButtonClicked = false;
 
       const cleanup = (): void => {
         observer?.disconnect();
@@ -1047,10 +1126,23 @@ export class AlphaCodingAdapter implements SiteAdapter {
       };
       const inspect = (): void => {
         const solution = findPageAnswerSolution(exercise);
-        if (!solution) return;
-        const values = pageAnswerValues(solution);
-        if (values.length === 0) return;
-        finish(parse(solution));
+        if (solution) {
+          const answer = parse(solution);
+          if (answer) {
+            finish(answer);
+            return;
+          }
+        }
+        if (existingSolution || answerButtonClicked) return;
+
+        const button = findPageAnswerButton(exercise);
+        if (!button) return;
+        answerButtonClicked = true;
+        try {
+          button.click();
+        } catch {
+          finish(null);
+        }
       };
 
       observer = new MutationObserverConstructor(inspect);
@@ -1061,11 +1153,13 @@ export class AlphaCodingAdapter implements SiteAdapter {
         attributes: true
       });
       timer = setTimeout(() => finish(null), PAGE_ANSWER_TIMEOUT_MS);
-      try {
-        button.click();
-      } catch {
-        finish(null);
-        return;
+      if (shouldOpenSolutionTab && solutionTab) {
+        try {
+          solutionTab.click();
+        } catch {
+          finish(null);
+          return;
+        }
       }
       inspect();
     });
@@ -1079,9 +1173,9 @@ export class AlphaCodingAdapter implements SiteAdapter {
     return { ...question, files: snapshot.files };
   }
 
-  async fillAnswer(answer: AIAnswer): Promise<void> {
+  async fillAnswer(answer: AIAnswer, options?: FillAnswerOptions): Promise<void> {
     if (answer.type === 'project') {
-      await this.fillProjectAnswer(answer);
+      await this.fillProjectAnswer(answer, options?.allowOverwrite === true);
       return;
     }
 
@@ -1134,8 +1228,9 @@ export class AlphaCodingAdapter implements SiteAdapter {
     await this.fillCode(answer.code);
   }
 
-  private async fillProjectAnswer(answer: ProjectAnswer): Promise<void> {
+  private async fillProjectAnswer(answer: ProjectAnswer, allowOverwrite = false): Promise<void> {
     const snapshot = await collectProjectFiles(this.document, this.readCode);
+    if (allowOverwrite) this.originalProjectSnapshot = snapshot;
     const sourceByPath = new Map(
       snapshot.files.map((file) => [normalizeProjectPath(file.path), file])
     );
@@ -1153,7 +1248,7 @@ export class AlphaCodingAdapter implements SiteAdapter {
       if (candidates.has(normalizedPath)) {
         throw appError('EDITOR_WRITE_FAILED', `重复的项目文件：${sourceFile.path}`);
       }
-      if (!preservesOriginalCode(sourceFile.code, file.code)) {
+      if (!allowOverwrite && !preservesOriginalCode(sourceFile.code, file.code)) {
         throw appError('EDITOR_WRITE_FAILED', `AI 修改了 ${sourceFile.path} 的原有代码`);
       }
       candidates.set(normalizedPath, file.code);
@@ -1205,6 +1300,32 @@ export class AlphaCodingAdapter implements SiteAdapter {
         );
       }
       throw error;
+    } finally {
+      const originalEntry = snapshot.entries.find((entry) => entry.path === snapshot.activePath);
+      if (originalEntry) await selectProjectFile(this.document, originalEntry);
+    }
+  }
+
+  async restoreOriginalProjectFiles(): Promise<void> {
+    const snapshot = this.originalProjectSnapshot;
+    this.originalProjectSnapshot = undefined;
+    if (!snapshot) return;
+
+    const writeTargets = snapshot.files
+      .filter((file) => file.editable && isPythonProjectPath(file.path))
+      .map((file) => {
+        const entry = snapshot.entries.find((candidate) => (
+          normalizeProjectPath(candidate.path) === normalizeProjectPath(file.path)
+        ));
+        if (!entry) throw appError('EDITOR_NOT_FOUND', `未找到项目文件：${file.path}`);
+        return { entry, file };
+      });
+
+    try {
+      for (const target of writeTargets) {
+        await selectProjectFile(this.document, target.entry);
+        await this.fillCode(target.file.code);
+      }
     } finally {
       const originalEntry = snapshot.entries.find((entry) => entry.path === snapshot.activePath);
       if (originalEntry) await selectProjectFile(this.document, originalEntry);
