@@ -7,6 +7,7 @@ export interface ConfigStorage {
 }
 
 export const DEFAULT_CONFIG: AIConfig = {
+  enabled: true,
   answerMode: 'hybrid',
   baseUrl: '',
   apiKey: '',
@@ -19,6 +20,7 @@ export const DEFAULT_CONFIG: AIConfig = {
 };
 
 const configKeys = [
+  'enabled',
   'answerMode',
   'baseUrl',
   'apiKey',
@@ -36,6 +38,7 @@ function isAnswerMode(value: unknown): value is AnswerMode {
 
 function readConfigValue(stored: Record<string, unknown>): AIConfig {
   return {
+    enabled: typeof stored.enabled === 'boolean' ? stored.enabled : DEFAULT_CONFIG.enabled,
     answerMode: isAnswerMode(stored.answerMode)
       ? stored.answerMode
       : DEFAULT_CONFIG.answerMode,
@@ -97,6 +100,7 @@ export async function saveConfig(
 ): Promise<void> {
   validateConfig(config);
   await storage.set({
+    enabled: config.enabled,
     answerMode: config.answerMode,
     baseUrl: config.baseUrl,
     apiKey: config.apiKey,
@@ -117,4 +121,14 @@ export async function saveAnswerMode(
     throw appError('AI_CONFIG_INVALID', '答题模式无效');
   }
   await storage.set({ answerMode });
+}
+
+export async function saveEnabled(
+  storage: ConfigStorage,
+  enabled: boolean
+): Promise<void> {
+  if (typeof enabled !== 'boolean') {
+    throw appError('AI_CONFIG_INVALID', '插件开关值无效');
+  }
+  await storage.set({ enabled });
 }

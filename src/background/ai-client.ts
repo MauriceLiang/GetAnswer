@@ -44,8 +44,8 @@ export function buildPrompt(question: Question): string {
     return [
       '你是在线课程多文件 Python 项目求解器。',
       '必须阅读下面列出的每一个文件及其完整原始内容，再完成题目。',
-      '只能修改 Python 文件（扩展名为 .py），data.txt、json、csv 等非 Python 文件只能读取，禁止返回或修改它们。',
-      '每个 Python 文件的原有代码必须原样保留、顺序不变，只能新增代码；不得删除、替换、重排或改写任何原有行。',
+      '只能修改明确标记为可修改的 Python 文件；未标记的文件只能读取，禁止返回或修改它们。',
+      '存在 program.py 时通常只返回 program.py；每个可修改文件的原有代码必须原样保留、顺序不变，只能新增代码；不得删除、替换、重排或改写任何原有行。',
       `必须为每个可修改的 Python 文件返回一次完整代码，严格返回 JSON：${answerExample}`,
       'path 必须使用下面给出的文件路径，code 必须是该文件写入后的完整内容，不要返回 Markdown、解释或其他文字。',
       `题目标题：${question.title ?? ''}`,

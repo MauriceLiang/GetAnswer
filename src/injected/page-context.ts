@@ -8,6 +8,8 @@ interface CodeMirrorElement extends Element {
   CodeMirror?: CodeMirrorInstance;
 }
 
+const cancelledRequestIds = new Set<string>();
+
 function postResult(targetWindow: Window, result: Record<string, unknown>): void {
   targetWindow.postMessage({ type: 'AI_FILL_CODE_RESULT', ...result }, '*');
 }
@@ -31,6 +33,18 @@ export function handlePageMessage(
   targetWindow: Window
 ): boolean {
   if (event.source !== targetWindow) return false;
+
+  if (event.data?.type === 'AI_CANCEL_CODE') {
+    if (typeof event.data.requestId === 'string') {
+      cancelledRequestIds.add(event.data.requestId);
+    }
+    return true;
+  }
+
+  if (event.data?.type === 'AI_READ_CODE' || event.data?.type === 'AI_FILL_CODE') {
+    const requestId = event.data.requestId;
+    if (typeof requestId === 'string' && cancelledRequestIds.delete(requestId)) return true;
+  }
 
   if (event.data?.type === 'AI_READ_CODE') {
     const editor = document.querySelector('.CodeMirror') as CodeMirrorElement | null;

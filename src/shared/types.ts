@@ -73,6 +73,7 @@ export interface PageContext {
 }
 
 export interface AIConfig {
+  enabled: boolean;
   answerMode: AnswerMode;
   baseUrl: string;
   apiKey: string;
@@ -91,6 +92,7 @@ export type AppErrorCode =
   | 'EDITOR_NOT_FOUND'
   | 'EDITOR_WRITE_FAILED'
   | 'AI_CONFIG_INVALID'
+  | 'PLUGIN_DISABLED'
   | 'AI_REQUEST_FAILED'
   | 'AI_RESPONSE_INVALID'
   | 'SUBMIT_FAILED'

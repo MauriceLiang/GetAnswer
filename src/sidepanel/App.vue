@@ -4,7 +4,8 @@ import {
   DEFAULT_CONFIG,
   loadConfig,
   saveAnswerMode,
-  saveConfig
+  saveConfig,
+  saveEnabled
 } from '../background/config';
 import { isExtensionMessage } from '../shared/messages';
 import type {
@@ -70,7 +71,7 @@ const answerModeOptions: Array<{
 
 const question = computed(() => pageContext.value.question);
 const isSolving = computed(() => status.value === 'requesting' || status.value === 'filling');
-const canSolve = computed(() => pageContext.value.supported
+const canSolve = computed(() => config.value.enabled && pageContext.value.supported
   && (question.value?.type === 'programming'
     || question.value?.type === 'project'
     || question.value?.type === 'choice'
@@ -194,6 +195,13 @@ function applyPageContext(context: PageContext): void {
     answerText.value = '';
     answerSource.value = 'ai';
   }
+  if (!config.value.enabled) {
+    autoSolveQuestionKey.value = null;
+    autoAdvanceVideoKey.value = null;
+    status.value = 'idle';
+    statusText.value = '插件已关闭';
+    return;
+  }
   if (context.supported && context.question) {
     autoAdvanceVideoKey.value = null;
     const stoppedCurrentQuestion = stoppedQuestionKeys.has(nextQuestionKey ?? '');
@@ -228,7 +236,8 @@ function applyPageContext(context: PageContext): void {
 }
 
 function maybeSkipInformationalPage(context: PageContext): void {
-  if (!context.isInformationalPage
+  if (!config.value.enabled
+    || !context.isInformationalPage
     || (!config.value.autoSolve && !autoAnswerRunning.value)
     || skipInfoPageInFlight) {
     return;
@@ -264,6 +273,7 @@ function maybeSkipInformationalPage(context: PageContext): void {
 
 const handleMessage = (message: unknown): void => {
   if (!isExtensionMessage(message)) return;
+  if (!config.value.enabled && message.type !== 'PAGE_CONTEXT') return;
 
   if (message.type === 'PAGE_CONTEXT') {
     applyPageContext(message.data);
@@ -297,6 +307,13 @@ const handleMessage = (message: unknown): void => {
 };
 
 async function refresh(): Promise<void> {
+  if (!config.value.enabled) {
+    status.value = 'idle';
+    statusText.value = '插件已关闭';
+    errorMessage.value = '';
+    return;
+  }
+
   autoAdvanceVideoKey.value = null;
   status.value = 'scanning';
   statusText.value = '正在识别页面';
@@ -315,6 +332,12 @@ async function refresh(): Promise<void> {
 }
 
 async function startAutoAnswer(): Promise<void> {
+  if (!config.value.enabled) {
+    status.value = 'idle';
+    statusText.value = '插件已关闭';
+    return;
+  }
+
   const generation = ++solveGeneration;
   isStartingAnswer.value = true;
   autoAnswerRunning.value = true;
@@ -376,6 +399,42 @@ async function loadStoredConfig(): Promise<void> {
   config.value = await loadConfig(chrome.storage.local);
 }
 
+async function togglePlugin(): Promise<void> {
+  const previousEnabled = config.value.enabled;
+  const nextEnabled = !previousEnabled;
+  config.value.enabled = nextEnabled;
+
+  try {
+    await saveEnabled(chrome.storage.local, nextEnabled);
+  } catch (error) {
+    config.value.enabled = previousEnabled;
+    setError(error instanceof Error ? error.message : '插件开关保存失败');
+    return;
+  }
+
+  if (!nextEnabled) {
+    solveGeneration += 1;
+    autoAnswerRunning.value = false;
+    autoAnswerStopped.value = true;
+    isStartingAnswer.value = false;
+    autoSolveQuestionKey.value = null;
+    autoAdvanceVideoKey.value = null;
+    status.value = 'idle';
+    statusText.value = '插件已关闭';
+    errorMessage.value = '';
+
+    try {
+      await chrome.runtime.sendMessage({ type: 'STOP_SOLVING' });
+    } catch {
+      // The persisted switch still prevents new work from starting.
+    }
+    return;
+  }
+
+  autoAnswerStopped.value = false;
+  await refresh();
+}
+
 async function handleAnswerModeChange(): Promise<void> {
   try {
     await saveAnswerMode(chrome.storage.local, config.value.answerMode);
@@ -391,6 +450,11 @@ async function saveStoredConfig(): Promise<void> {
     await saveConfig(chrome.storage.local, config.value);
     statusText.value = '配置已保存';
     errorMessage.value = '';
+    if (!config.value.enabled) {
+      status.value = 'idle';
+      statusText.value = '插件已关闭';
+      return;
+    }
     if (config.value.autoSolve && !autoAnswerStopped.value) {
       maybeAutoSolve(pageContext.value);
     } else {
@@ -448,7 +512,8 @@ async function testConnection(): Promise<void> {
 }
 
 function maybeAutoSolve(context: PageContext): void {
-  if ((!config.value.autoSolve && !autoAnswerRunning.value) || !context.question
+  if (!config.value.enabled
+    || (!config.value.autoSolve && !autoAnswerRunning.value) || !context.question
     || autoAnswerStopped.value
     || (context.question.type !== 'programming'
       && context.question.type !== 'project'
@@ -469,7 +534,11 @@ function maybeAutoSolve(context: PageContext): void {
 }
 
 function maybeAutoAdvanceVideo(context: PageContext): void {
-  if (!config.value.autoAdvanceVideo || !context.supported || !context.hasVideo || context.question) {
+  if (!config.value.enabled
+    || !config.value.autoAdvanceVideo
+    || !context.supported
+    || !context.hasVideo
+    || context.question) {
     return;
   }
 
@@ -516,7 +585,10 @@ async function solve(): Promise<void> {
 }
 
 async function advanceVideo(): Promise<void> {
-  if (!pageContext.value.supported || !pageContext.value.hasVideo || question.value) return;
+  if (!config.value.enabled
+    || !pageContext.value.supported
+    || !pageContext.value.hasVideo
+    || question.value) return;
 
   status.value = 'filling';
   statusText.value = '正在完成视频';
@@ -556,13 +628,28 @@ onBeforeUnmount(() => {
         <h1>AI 学习助手</h1>
         <p class="status" :class="`status-${status}`">状态：{{ statusText }}</p>
       </div>
-      <button
-        type="button"
-        v-if="config.answerMode !== 'page'"
-        class="secondary settings-button"
-        aria-label="打开模型配置"
-        @click="showConfigModal = true"
-      >模型配置</button>
+      <div class="header-actions">
+        <button
+          type="button"
+          class="plugin-switch"
+          role="switch"
+          :aria-checked="config.enabled"
+          :aria-label="config.enabled ? '关闭插件' : '开启插件'"
+          @click="togglePlugin"
+        >
+          <span class="plugin-switch-track" aria-hidden="true">
+            <span class="plugin-switch-thumb"></span>
+          </span>
+          <span>{{ config.enabled ? '插件已开启' : '插件已关闭' }}</span>
+        </button>
+        <button
+          type="button"
+          v-if="config.answerMode !== 'page'"
+          class="secondary settings-button"
+          aria-label="打开模型配置"
+          @click="showConfigModal = true"
+        >模型配置</button>
+      </div>
     </header>
 
     <section class="question-card">
@@ -672,11 +759,11 @@ onBeforeUnmount(() => {
       <button
         type="button"
         class="start-answer"
-        :disabled="isStartingAnswer"
+        :disabled="!config.enabled || isStartingAnswer"
         @click="startAutoAnswer"
       >{{ isStartingAnswer ? '刷新中…' : '开始答题' }}</button>
       <button type="button" class="stop-answer" @click="stopAutoAnswer">停止答题</button>
-      <button type="button" class="secondary" @click="refresh">重新识别</button>
+      <button type="button" class="secondary" :disabled="!config.enabled" @click="refresh">重新识别</button>
       <button type="button" class="solve" :disabled="!canSolve" @click="solve">{{ solveButtonText }}</button>
     </section>
 
@@ -691,6 +778,7 @@ onBeforeUnmount(() => {
 <style scoped>
 .panel { padding: 16px; color: #1f2937; font: 14px/1.5 system-ui, sans-serif; }
 .app-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.header-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
 h1 { margin: 0; font-size: 20px; }
 h2 { margin: 8px 0; font-size: 15px; }
 .status { margin: 4px 0 16px; color: #2563eb; }
@@ -717,6 +805,11 @@ input, select { box-sizing: border-box; display: block; width: 100%; margin-top:
 .connection-message-error { color: #b91c1c; }
 button { border: 0; border-radius: 6px; padding: 8px 12px; cursor: pointer; }
 button:disabled { cursor: not-allowed; opacity: .5; }
+.plugin-switch { display: inline-flex; align-items: center; gap: 6px; padding: 4px 0; color: #1f2937; background: transparent; }
+.plugin-switch-track { display: inline-flex; align-items: center; width: 32px; height: 18px; padding: 2px; border-radius: 999px; background: #9ca3af; transition: background .15s ease; }
+.plugin-switch[aria-checked="true"] .plugin-switch-track { background: #16a34a; }
+.plugin-switch-thumb { width: 14px; height: 14px; border-radius: 50%; background: white; box-shadow: 0 1px 2px rgb(15 23 42 / 25%); transition: transform .15s ease; }
+.plugin-switch[aria-checked="true"] .plugin-switch-thumb { transform: translateX(14px); }
 .settings-button { flex: 0 0 auto; }
 .modal-backdrop { position: fixed; inset: 0; z-index: 10; display: flex; justify-content: center; padding: 16px; overflow: auto; background: rgb(15 23 42 / 35%); }
 .config-modal { width: min(100%, 360px); margin: 0; background: #fff; box-shadow: 0 12px 32px rgb(15 23 42 / 25%); }

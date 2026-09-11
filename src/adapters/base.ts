@@ -4,11 +4,12 @@ import type {
   QuestionType
 } from '../shared/types';
 
-export type CodeFiller = (code: string) => Promise<void>;
-export type CodeReader = () => Promise<string>;
+export type CodeFiller = (code: string, signal?: AbortSignal) => Promise<void>;
+export type CodeReader = (signal?: AbortSignal) => Promise<string>;
 
 export interface FillAnswerOptions {
   allowOverwrite?: boolean;
+  signal?: AbortSignal;
 }
 
 export interface SiteAdapter {
@@ -18,11 +19,12 @@ export interface SiteAdapter {
   isInformationalPage?(): boolean;
   skipInformationalPage?(): void;
   extractQuestion(): Question | null;
-  extractQuestionAsync?(): Promise<Question | null>;
+  extractQuestionAsync?(signal?: AbortSignal): Promise<Question | null>;
   extractAnswer?(): Promise<AIAnswer | null>;
   fillAnswer(answer: AIAnswer, options?: FillAnswerOptions): Promise<void>;
   restoreOriginalProjectFiles?(): Promise<void>;
   submitAnswer?(): Promise<void>;
   watchSubmissionResult?(): void;
+  stopSubmissionResultWatcher?(): void;
   completeVideo?(): Promise<void>;
 }

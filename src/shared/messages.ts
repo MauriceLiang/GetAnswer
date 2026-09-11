@@ -84,7 +84,7 @@ function isProjectFile(value: unknown): value is ProjectFile {
     && value.path.trim().length > 0
     && typeof value.code === 'string'
     && typeof value.editable === 'boolean'
-    && value.editable === isPythonProjectPath(value.path);
+    && (!value.editable || isPythonProjectPath(value.path));
 }
 
 function isQuestion(value: unknown): value is Question {
@@ -176,6 +176,7 @@ function isAppError(value: unknown): value is AppError {
     'EDITOR_NOT_FOUND',
     'EDITOR_WRITE_FAILED',
     'AI_CONFIG_INVALID',
+    'PLUGIN_DISABLED',
     'AI_REQUEST_FAILED',
     'AI_RESPONSE_INVALID',
     'SUBMIT_FAILED',

@@ -1,8 +1,10 @@
 import { findAdapter } from '../adapters';
+import { loadConfig } from '../background/config';
 import { appError, AppErrorException } from '../shared/errors';
 import { isExtensionMessage } from '../shared/messages';
 import type { ExtensionMessage } from '../shared/messages';
-import type { AppError } from '../shared/types';
+import type { AppError, PageContext } from '../shared/types';
+import type { SiteAdapter } from '../adapters/base';
 import { createDebouncedScanner, scanPage } from './scanner';
 import { fillCodeInPage, readCodeInPage } from './injected-bridge';
 
@@ -35,12 +37,37 @@ function injectPageContext(): Promise<void> {
   return ready;
 }
 
-const pageContextReady = injectPageContext();
-const fillCode = (code: string) => fillCodeInPage(code, window);
-const readCode = () => readCodeInPage(window);
+const disabledPageContext: PageContext = {
+  adapter: 'none',
+  supported: false,
+  hasVideo: false,
+  hasEditor: false
+};
+let pluginEnabled = true;
+const pluginStateReady = loadConfig()
+  .then((config) => {
+    pluginEnabled = config.enabled;
+  })
+  .catch(() => undefined);
+let pageContextReady: Promise<void> | undefined;
+const fillCode = (code: string, signal?: AbortSignal) => signal
+  ? fillCodeInPage(code, window, undefined, signal)
+  : fillCodeInPage(code, window);
+const readCode = (signal?: AbortSignal) => signal
+  ? readCodeInPage(window, undefined, signal)
+  : readCodeInPage(window);
 let submissionWatcherStarted = false;
+let submissionAdapter: SiteAdapter | undefined;
 let solveGeneration = 0;
 let projectContextCollecting = false;
+let projectScanController: AbortController | undefined;
+let fillController: AbortController | undefined;
+let pageScanGeneration = 0;
+
+function ensurePageContextReady(): Promise<void> {
+  pageContextReady ??= injectPageContext();
+  return pageContextReady;
+}
 
 function ensureSubmissionWatcher(): void {
   if (submissionWatcherStarted) return;
@@ -48,15 +75,18 @@ function ensureSubmissionWatcher(): void {
   if (!adapter?.watchSubmissionResult) return;
 
   adapter.watchSubmissionResult();
+  submissionAdapter = adapter;
   submissionWatcherStarted = true;
 }
 
 const scan = () => {
+  if (!pluginEnabled) return disabledPageContext;
   ensureSubmissionWatcher();
   return scanPage(document, window.location, fillCode);
 };
 
 function scanWithoutProjectFiles(): ReturnType<typeof scan> {
+  if (!pluginEnabled) return disabledPageContext;
   const context = scan();
   if (context.question?.type !== 'project') return context;
   const { question: _question, ...withoutQuestion } = context;
@@ -68,7 +98,15 @@ const emitPageContext = (context: ReturnType<typeof scan>) => {
   void chrome.runtime.sendMessage({ type: 'PAGE_CONTEXT', data: context }).catch(() => undefined);
 };
 
+function abortActivePageWork(): void {
+  solveGeneration += 1;
+  projectScanController?.abort();
+  fillController?.abort();
+  projectContextPromise = undefined;
+}
+
 function scanWithProjectFiles(): Promise<ReturnType<typeof scan>> {
+  if (!pluginEnabled) return Promise.resolve(disabledPageContext);
   if (projectContextPromise) return projectContextPromise;
 
   const adapter = findAdapter(document, window.location, fillCode, readCode);
@@ -76,42 +114,83 @@ function scanWithProjectFiles(): Promise<ReturnType<typeof scan>> {
     return Promise.resolve(scan());
   }
 
+  const controller = new AbortController();
+  projectScanController = controller;
   projectContextCollecting = true;
-  projectContextPromise = pageContextReady
-    .then(() => adapter.extractQuestionAsync!())
-    .then((question) => {
-      const context = scan();
-      return question ? { ...context, question, supported: true } : context;
-    })
+  const projectRunPromise = (async () => {
+    await ensurePageContextReady();
+    if (!pluginEnabled || controller.signal.aborted) return disabledPageContext;
+    const question = await adapter.extractQuestionAsync!(controller.signal);
+    if (!pluginEnabled || controller.signal.aborted) return disabledPageContext;
+    const context = scan();
+    return question ? { ...context, question, supported: true } : context;
+  })();
+  projectContextPromise = projectRunPromise
     .finally(() => {
+      if (projectScanController !== controller) return;
       projectContextCollecting = false;
+      projectScanController = undefined;
       projectContextPromise = undefined;
     });
   return projectContextPromise;
 }
 
 async function scanForEmit(): Promise<ReturnType<typeof scan>> {
+  const scanGeneration = pageScanGeneration;
   try {
-    return await scanWithProjectFiles();
+    await pluginStateReady;
+    if (!pluginEnabled) return disabledPageContext;
+    void ensurePageContextReady();
+    const context = await scanWithProjectFiles();
+    return scanGeneration === pageScanGeneration ? context : scanForEmit();
   } catch {
-    return scanWithoutProjectFiles();
+    return scanGeneration === pageScanGeneration
+      ? scanWithoutProjectFiles()
+      : scanForEmit();
   }
 }
+
+function stopSubmissionWatcher(): void {
+  submissionAdapter?.stopSubmissionResultWatcher?.();
+  submissionAdapter = undefined;
+  submissionWatcherStarted = false;
+}
+
+function setPluginEnabled(enabled: boolean): void {
+  if (pluginEnabled === enabled) return;
+  pluginEnabled = enabled;
+  pageScanGeneration += 1;
+  if (!enabled) {
+    abortActivePageWork();
+    stopSubmissionWatcher();
+    emitPageContext(disabledPageContext);
+    return;
+  }
+
+  void scanForEmit().then(emitPageContext);
+}
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== 'local' || typeof changes.enabled?.newValue !== 'boolean') return;
+  setPluginEnabled(changes.enabled.newValue);
+});
 
 void scanForEmit().then(emitPageContext);
 
 const scheduleScan = createDebouncedScanner(scanForEmit, emitPageContext, 300);
 const observer = new MutationObserver(() => {
-  if (!projectContextCollecting) scheduleScan();
+  if (pluginEnabled && !projectContextCollecting) scheduleScan();
 });
 observer.observe(document.body, { childList: true, subtree: true });
-window.addEventListener('popstate', scheduleScan);
+window.addEventListener('popstate', () => {
+  if (pluginEnabled) scheduleScan();
+});
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (!isExtensionMessage(message)) return;
 
   if (message.type === 'GET_PAGE_CONTEXT') {
-    void scanWithProjectFiles()
+    void pluginStateReady.then(() => scanWithProjectFiles())
       .then((context) => sendResponse({ type: 'PAGE_CONTEXT', data: context } satisfies ExtensionMessage))
       .catch(() => sendResponse({
         type: 'PAGE_CONTEXT',
@@ -121,6 +200,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (message.type === 'GET_PAGE_ANSWER') {
+    if (!pluginEnabled) {
+      sendResponse({ type: 'PAGE_ANSWER' } satisfies ExtensionMessage);
+      return;
+    }
     const adapter = findAdapter(document, window.location, fillCode, readCode);
     if (!adapter?.extractAnswer) {
       sendResponse({ type: 'PAGE_ANSWER' } satisfies ExtensionMessage);
@@ -137,12 +220,20 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (message.type === 'STOP_SOLVING') {
-    solveGeneration += 1;
+    abortActivePageWork();
     sendResponse({ type: 'STOP_SOLVING_RESULT', success: true } satisfies ExtensionMessage);
     return;
   }
 
   if (message.type === 'ADVANCE_VIDEO') {
+    if (!pluginEnabled) {
+      sendResponse({
+        type: 'VIDEO_RESULT',
+        success: false,
+        error: appError('PLUGIN_DISABLED', '插件已关闭')
+      } satisfies ExtensionMessage);
+      return;
+    }
     const adapter = findAdapter(document, window.location, fillCode);
     if (!adapter?.completeVideo) {
       sendResponse({
@@ -164,6 +255,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (message.type === 'SKIP_INFO_PAGE') {
+    if (!pluginEnabled) {
+      sendResponse({
+        type: 'INFO_PAGE_RESULT',
+        success: false,
+        error: appError('PLUGIN_DISABLED', '插件已关闭')
+      } satisfies ExtensionMessage);
+      return;
+    }
     const adapter = findAdapter(document, window.location, fillCode);
     if (!adapter?.skipInformationalPage) {
       sendResponse({
@@ -189,6 +288,15 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (message.type !== 'FILL_ANSWER') return;
 
+  if (!pluginEnabled) {
+    sendResponse({
+      type: 'FILL_RESULT',
+      success: false,
+      error: appError('PLUGIN_DISABLED', '插件已关闭')
+    } satisfies ExtensionMessage);
+    return;
+  }
+
   const adapter = findAdapter(document, window.location, fillCode, readCode);
   if (!adapter) {
     sendResponse({
@@ -200,11 +308,19 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   const currentSolveGeneration = solveGeneration;
-  const isStopped = () => currentSolveGeneration !== solveGeneration;
+  fillController?.abort();
+  const controller = new AbortController();
+  fillController = controller;
+  const isStopped = () => currentSolveGeneration !== solveGeneration
+    || controller.signal.aborted
+    || !pluginEnabled;
   const projectAnswerFilling = message.answer.type === 'project';
   if (projectAnswerFilling) projectContextCollecting = true;
 
-  void adapter.fillAnswer(message.answer, { allowOverwrite: message.source === 'page' })
+  void adapter.fillAnswer(message.answer, {
+    allowOverwrite: message.source === 'page',
+    signal: controller.signal
+  })
     .then(async () => {
       if (isStopped()) {
         sendResponse({ type: 'FILL_RESULT', success: false } satisfies ExtensionMessage);
@@ -228,9 +344,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     })
     .catch(async (error: unknown) => {
       const errorValue = toAppError(error);
+      if (isStopped()) {
+        sendResponse({ type: 'FILL_RESULT', success: false } satisfies ExtensionMessage);
+        return;
+      }
       if (message.source === 'page'
         && projectAnswerFilling
-        && errorValue.code === 'SUBMIT_FAILED'
+        && errorValue.code !== 'PLUGIN_DISABLED'
         && adapter.restoreOriginalProjectFiles) {
         try {
           await adapter.restoreOriginalProjectFiles();
@@ -253,6 +373,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       } satisfies ExtensionMessage);
     })
     .finally(() => {
+      if (fillController === controller) fillController = undefined;
       if (projectAnswerFilling) projectContextCollecting = false;
     });
   return true;

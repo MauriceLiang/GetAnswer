@@ -94,6 +94,14 @@ export function createMessageHandler(dependencies: MessageHandlerDependencies) {
 
   return async (message: ExtensionMessage, _sender: unknown): Promise<unknown> => {
     if (message.type === 'GET_PAGE_CONTEXT') {
+      const config = await dependencies.getConfig();
+      if (!config.enabled) {
+        return {
+          type: 'PAGE_CONTEXT',
+          data: { adapter: 'none', supported: false, hasVideo: false, hasEditor: false }
+        } satisfies ExtensionMessage;
+      }
+
       const tabId = await dependencies.getActiveTabId();
       if (tabId === null) {
         return {
@@ -105,6 +113,15 @@ export function createMessageHandler(dependencies: MessageHandlerDependencies) {
     }
 
     if (message.type === 'REFRESH_PAGE') {
+      const config = await dependencies.getConfig();
+      if (!config.enabled) {
+        return {
+          type: 'REFRESH_PAGE_RESULT',
+          success: false,
+          error: appError('PLUGIN_DISABLED', '插件已关闭')
+        } satisfies ExtensionMessage;
+      }
+
       const tabId = await dependencies.getActiveTabId();
       if (tabId === null) {
         return {
@@ -135,6 +152,15 @@ export function createMessageHandler(dependencies: MessageHandlerDependencies) {
     }
 
     if (message.type === 'SKIP_INFO_PAGE') {
+      const config = await dependencies.getConfig();
+      if (!config.enabled) {
+        return {
+          type: 'INFO_PAGE_RESULT',
+          success: false,
+          error: appError('PLUGIN_DISABLED', '插件已关闭')
+        } satisfies ExtensionMessage;
+      }
+
       const tabId = await dependencies.getActiveTabId();
       if (tabId === null) {
         return {
@@ -178,6 +204,15 @@ export function createMessageHandler(dependencies: MessageHandlerDependencies) {
     }
 
     if (message.type === 'ADVANCE_VIDEO') {
+      const config = await dependencies.getConfig();
+      if (!config.enabled) {
+        return {
+          type: 'VIDEO_RESULT',
+          success: false,
+          error: appError('PLUGIN_DISABLED', '插件已关闭')
+        } satisfies ExtensionMessage;
+      }
+
       const tabId = await dependencies.getActiveTabId();
       if (tabId === null) {
         return {
@@ -224,6 +259,11 @@ export function createMessageHandler(dependencies: MessageHandlerDependencies) {
     const solvePromise = (async (): Promise<SolveResult> => {
       try {
         const config = await dependencies.getConfig();
+        if (!config.enabled) {
+          const error = appError('PLUGIN_DISABLED', '插件已关闭');
+          notifyCorrelated(dependencies, { type: 'STATUS', status: 'error', error }, questionKey);
+          return { filled: false, error } satisfies SolveResult;
+        }
         const answerMode = config.answerMode ?? 'hybrid';
         const pageAnswerEligible = answerMode !== 'ai'
           && (message.question.type === 'programming'
@@ -325,8 +365,11 @@ export function createMessageHandler(dependencies: MessageHandlerDependencies) {
           return { answer, filled: false, cancelled: true } satisfies SolveResult;
         }
 
+        const pageAnswerFailed = fillResult.error?.code === 'SUBMIT_FAILED'
+          || fillResult.error?.code === 'EDITOR_NOT_FOUND'
+          || fillResult.error?.code === 'EDITOR_WRITE_FAILED';
         if (!fillResult.success && answerMode === 'hybrid' && answerSource === 'page'
-          && fillResult.error?.code === 'SUBMIT_FAILED') {
+          && pageAnswerFailed) {
           answerSource = 'ai';
           await refreshProjectQuestion();
           notifyAIRequest();

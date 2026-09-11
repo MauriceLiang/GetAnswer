@@ -34,6 +34,18 @@ const defaultFillCode: CodeFiller = async () => {
   };
 };
 
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw appError('PLUGIN_DISABLED', '插件已关闭');
+}
+
+function fillCodeWithSignal(
+  fillCode: CodeFiller,
+  code: string,
+  signal?: AbortSignal
+): Promise<void> {
+  return signal ? fillCode(code, signal) : fillCode(code);
+}
+
 function textOf(element: Element | null): string {
   return element?.textContent?.replace(/\u00a0/g, ' ').trim() ?? '';
 }
@@ -409,6 +421,16 @@ function projectFileBaseName(path: string): string {
   return path.split('/').at(-1) ?? path;
 }
 
+function editableProjectFilePaths(entries: ProjectFileEntry[]): Set<string> {
+  const programFiles = entries.filter((entry) => (
+    projectFileBaseName(entry.path).toLowerCase() === 'program.py'
+  ));
+  const editableEntries = programFiles.length === 1
+    ? programFiles
+    : entries.filter((entry) => isPythonProjectPath(entry.path));
+  return new Set(editableEntries.map((entry) => normalizeProjectPath(entry.path)));
+}
+
 function projectFileTabMatches(
   tab: HTMLElement,
   entry: ProjectFileEntry,
@@ -457,8 +479,10 @@ function activeProjectFilePath(
 
 function waitForProjectFile(
   document: Document,
-  entry: ProjectFileEntry
+  entry: ProjectFileEntry,
+  signal?: AbortSignal
 ): Promise<void> {
+  throwIfAborted(signal);
   if (isProjectFileActive(document, entry)) return Promise.resolve();
 
   const MutationObserverConstructor = document.defaultView?.MutationObserver;
@@ -468,15 +492,29 @@ function waitForProjectFile(
   }
 
   return new Promise((resolve, reject) => {
-    let observer: MutationObserver;
-    let timer: ReturnType<typeof setTimeout>;
+    let observer: MutationObserver | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let settled = false;
 
     const cleanup = (): void => {
-      observer.disconnect();
-      clearTimeout(timer);
+      observer?.disconnect();
+      if (timer !== undefined) clearTimeout(timer);
+      signal?.removeEventListener('abort', handleAbort);
+    };
+    const handleAbort = (): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(appError('PLUGIN_DISABLED', '插件已关闭'));
     };
     const inspect = (): void => {
+      if (settled) return;
+      if (signal?.aborted) {
+        handleAbort();
+        return;
+      }
       if (!isProjectFileActive(document, entry)) return;
+      settled = true;
       cleanup();
       resolve();
     };
@@ -489,68 +527,91 @@ function waitForProjectFile(
       attributes: true
     });
     timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
       cleanup();
       reject(appError('EDITOR_NOT_FOUND', `切换项目文件失败：${entry.path}`));
     }, PROJECT_FILE_SWITCH_TIMEOUT_MS);
+    signal?.addEventListener('abort', handleAbort, { once: true });
     inspect();
   });
 }
 
 async function selectProjectFile(
   document: Document,
-  entry: ProjectFileEntry
+  entry: ProjectFileEntry,
+  signal?: AbortSignal
 ): Promise<void> {
+  throwIfAborted(signal);
   if (!isProjectFileActive(document, entry)) {
     const tab = findProjectFileTab(document, entry);
-    const pending = waitForProjectFile(document, entry);
-    (tab ?? entry.trigger).click();
-    await pending;
+    const pending = waitForProjectFile(document, entry, signal);
+    try {
+      throwIfAborted(signal);
+      (tab ?? entry.trigger).click();
+      await pending;
+    } catch (error) {
+      void pending.catch(() => undefined);
+      throw error;
+    }
   }
+  throwIfAborted(signal);
   // The tab state and the CodeMirror value are updated by separate Vue ticks.
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  throwIfAborted(signal);
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  throwIfAborted(signal);
 }
 
 function collectVisibleProjectFiles(document: Document): ProjectFile[] {
   const entries = projectFileEntries(document);
+  const editablePaths = editableProjectFilePaths(entries);
   const activePath = activeProjectFilePath(document, entries);
   const activeCode = extractEditorCode(document) ?? '';
   return entries.map((entry) => ({
     path: entry.path,
     code: entry.path === activePath ? activeCode : '',
-    editable: isPythonProjectPath(entry.path)
+    editable: editablePaths.has(normalizeProjectPath(entry.path))
   }));
 }
 
 async function collectProjectFiles(
   document: Document,
-  readCode?: CodeReader
+  readCode?: CodeReader,
+  signal?: AbortSignal
 ): Promise<ProjectFileSnapshot> {
+  throwIfAborted(signal);
   const entries = projectFileEntries(document);
   if (entries.length === 0) {
     throw appError('EDITOR_NOT_FOUND', '未找到项目文件列表');
   }
 
   const activePath = activeProjectFilePath(document, entries);
+  const editablePaths = editableProjectFilePaths(entries);
   const files: ProjectFile[] = [];
   try {
     for (const entry of entries) {
-      await selectProjectFile(document, entry);
+      throwIfAborted(signal);
+      await selectProjectFile(document, entry, signal);
+      throwIfAborted(signal);
       if (!document.querySelector('.CodeMirror')) {
         throw appError('EDITOR_NOT_FOUND', `未找到文件编辑器：${entry.path}`);
       }
       const code = readCode
-        ? await readCode()
+        ? await readCode(signal)
         : extractEditorCode(document) ?? '';
+      throwIfAborted(signal);
       files.push({
         path: entry.path,
         code,
-        editable: isPythonProjectPath(entry.path)
+        editable: editablePaths.has(normalizeProjectPath(entry.path))
       });
     }
   } finally {
     const originalEntry = entries.find((entry) => entry.path === activePath);
-    if (originalEntry) await selectProjectFile(document, originalEntry);
+    if (originalEntry && !signal?.aborted) {
+      await selectProjectFile(document, originalEntry, signal);
+    }
   }
 
   return { entries, files, ...(activePath ? { activePath } : {}) };
@@ -837,14 +898,32 @@ function parsePageProgrammingAnswer(solution: HTMLElement): AIAnswer | null {
   return code ? { type: 'programming', code } : null;
 }
 
-function parsePageProjectAnswer(solution: HTMLElement): AIAnswer | null {
-  const files = Array.from(solution.querySelectorAll<HTMLElement>('.space-y-1'))
-    .flatMap((fileBlock) => {
-      const path = textOf(fileBlock.querySelector('h3'));
-      const code = fileBlock.querySelector('pre.code-solution, pre')?.textContent?.trim() ?? '';
-      return path && code ? [{ path, code }] : [];
-    });
-  return files.length > 0 ? { type: 'project', files } : null;
+function parsePageProjectAnswer(
+  solution: HTMLElement,
+  question: Question
+): AIAnswer | null {
+  const editableFiles = (question.files ?? []).filter((file) => (
+    file.editable && isPythonProjectPath(file.path)
+  ));
+  const sourcePathByNormalizedPath = new Map(
+    editableFiles.map((file) => [normalizeProjectPath(file.path), file.path])
+  );
+  const files: ProjectAnswer['files'] = [];
+  const seenPaths = new Set<string>();
+
+  for (const fileBlock of Array.from(solution.querySelectorAll<HTMLElement>('.space-y-1'))) {
+    const rawPath = textOf(fileBlock.querySelector('h3'));
+    const normalizedPath = normalizeProjectPath(rawPath);
+    const path = sourcePathByNormalizedPath.get(normalizedPath);
+    const code = fileBlock.querySelector('pre.code-solution, pre')?.textContent?.trim() ?? '';
+    if (!path || !code || seenPaths.has(normalizedPath)) continue;
+    seenPaths.add(normalizedPath);
+    files.push({ path, code });
+  }
+
+  return files.length === editableFiles.length && files.length > 0
+    ? { type: 'project', files }
+    : null;
 }
 
 function parsePageAnswer(
@@ -859,7 +938,7 @@ function parsePageAnswer(
     case 'programming':
       return parsePageProgrammingAnswer(solution);
     case 'project':
-      return parsePageProjectAnswer(solution);
+      return parsePageProjectAnswer(solution, question);
     default:
       return null;
   }
@@ -959,6 +1038,7 @@ function clickNextItemButton(
 export class AlphaCodingAdapter implements SiteAdapter {
   name = 'alphacoding';
   private submissionObserver?: MutationObserver;
+  private submissionClickListener?: (event: Event) => void;
   private originalProjectSnapshot?: ProjectFileSnapshot;
 
   constructor(
@@ -1165,17 +1245,20 @@ export class AlphaCodingAdapter implements SiteAdapter {
     });
   }
 
-  async extractQuestionAsync(): Promise<Question | null> {
+  async extractQuestionAsync(signal?: AbortSignal): Promise<Question | null> {
+    throwIfAborted(signal);
     if (this.detectQuestionType() !== 'project') return this.extractQuestion();
     const question = this.extractQuestion();
     if (!question || question.type !== 'project') return null;
-    const snapshot = await collectProjectFiles(this.document, this.readCode);
+    const snapshot = await collectProjectFiles(this.document, this.readCode, signal);
     return { ...question, files: snapshot.files };
   }
 
   async fillAnswer(answer: AIAnswer, options?: FillAnswerOptions): Promise<void> {
+    const signal = options?.signal;
+    throwIfAborted(signal);
     if (answer.type === 'project') {
-      await this.fillProjectAnswer(answer, options?.allowOverwrite === true);
+      await this.fillProjectAnswer(answer, options?.allowOverwrite === true, signal);
       return;
     }
 
@@ -1193,11 +1276,13 @@ export class AlphaCodingAdapter implements SiteAdapter {
         ? Object.getOwnPropertyDescriptor(view.HTMLInputElement.prototype, 'value')?.set
         : undefined;
       for (const [index, input] of inputs.entries()) {
+        throwIfAborted(signal);
         if (inputSetter) inputSetter.call(input, answer.values[index]);
         else input.value = answer.values[index];
         input.dispatchEvent(new (view?.Event ?? Event)('input', { bubbles: true }));
         input.dispatchEvent(new (view?.Event ?? Event)('change', { bubbles: true }));
       }
+      throwIfAborted(signal);
       return;
     }
 
@@ -1212,10 +1297,12 @@ export class AlphaCodingAdapter implements SiteAdapter {
       }
 
       for (const [index, input] of inputs.entries()) {
+        throwIfAborted(signal);
         const key = String.fromCharCode(65 + index);
         const shouldBeChecked = selected.has(key);
         if (input.checked !== shouldBeChecked) input.click();
       }
+      throwIfAborted(signal);
       return;
     }
 
@@ -1225,11 +1312,15 @@ export class AlphaCodingAdapter implements SiteAdapter {
         message: '编程题答案为空'
       };
     }
-    await this.fillCode(answer.code);
+    await fillCodeWithSignal(this.fillCode, answer.code, signal);
   }
 
-  private async fillProjectAnswer(answer: ProjectAnswer, allowOverwrite = false): Promise<void> {
-    const snapshot = await collectProjectFiles(this.document, this.readCode);
+  private async fillProjectAnswer(
+    answer: ProjectAnswer,
+    allowOverwrite = false,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const snapshot = await collectProjectFiles(this.document, this.readCode, signal);
     if (allowOverwrite) this.originalProjectSnapshot = snapshot;
     const sourceByPath = new Map(
       snapshot.files.map((file) => [normalizeProjectPath(file.path), file])
@@ -1240,6 +1331,7 @@ export class AlphaCodingAdapter implements SiteAdapter {
     const candidates = new Map<string, string>();
 
     for (const file of answer.files) {
+      throwIfAborted(signal);
       const normalizedPath = normalizeProjectPath(file.path);
       const sourceFile = sourceByPath.get(normalizedPath);
       if (!sourceFile?.editable || !isPythonProjectPath(sourceFile.path)) {
@@ -1254,6 +1346,7 @@ export class AlphaCodingAdapter implements SiteAdapter {
       candidates.set(normalizedPath, file.code);
     }
 
+    throwIfAborted(signal);
     if (candidates.size !== editableFiles.length) {
       const missingFile = editableFiles.find((file) => (
         !candidates.has(normalizeProjectPath(file.path))
@@ -1278,18 +1371,31 @@ export class AlphaCodingAdapter implements SiteAdapter {
 
     try {
       for (const target of writeTargets) {
-        await selectProjectFile(this.document, target.entry);
+        throwIfAborted(signal);
+        await selectProjectFile(this.document, target.entry, signal);
+        throwIfAborted(signal);
         // Mark before calling the bridge: a lost response may occur after setValue().
         writtenTargets.push(target);
-        await this.fillCode(target.code);
+        await fillCodeWithSignal(this.fillCode, target.code, signal);
       }
+      throwIfAborted(signal);
     } catch (error) {
+      if (signal?.aborted) {
+        this.originalProjectSnapshot = undefined;
+        throw appError('PLUGIN_DISABLED', '插件已关闭');
+      }
       let rollbackFailed = false;
       for (const target of writtenTargets.reverse()) {
         try {
-          await selectProjectFile(this.document, target.entry);
-          await this.fillCode(target.file.code);
+          throwIfAborted(signal);
+          await selectProjectFile(this.document, target.entry, signal);
+          throwIfAborted(signal);
+          await fillCodeWithSignal(this.fillCode, target.file.code, signal);
         } catch {
+          if (signal?.aborted) {
+            this.originalProjectSnapshot = undefined;
+            throw appError('PLUGIN_DISABLED', '插件已关闭');
+          }
           rollbackFailed = true;
         }
       }
@@ -1302,7 +1408,9 @@ export class AlphaCodingAdapter implements SiteAdapter {
       throw error;
     } finally {
       const originalEntry = snapshot.entries.find((entry) => entry.path === snapshot.activePath);
-      if (originalEntry) await selectProjectFile(this.document, originalEntry);
+      if (originalEntry && !signal?.aborted) {
+        await selectProjectFile(this.document, originalEntry, signal);
+      }
     }
   }
 
@@ -1385,12 +1493,13 @@ export class AlphaCodingAdapter implements SiteAdapter {
     if (!MutationObserverConstructor || !root) return;
 
     // A new submission may reuse the previous question's footer DOM.
-    this.document.addEventListener('click', (event) => {
+    this.submissionClickListener = (event: Event): void => {
       const target = event.target as Node | null;
       if (target && findSubmitButton(this.document)?.contains(target)) {
         nextItemClicked.delete(this.document);
       }
-    }, true);
+    };
+    this.document.addEventListener('click', this.submissionClickListener, true);
 
     const clickIfReady = (): void => {
       if (submissionInFlight) return;
@@ -1406,6 +1515,16 @@ export class AlphaCodingAdapter implements SiteAdapter {
       characterData: true,
       attributes: true
     });
+  }
+
+  stopSubmissionResultWatcher(): void {
+    nextItemClicked.delete(this.document);
+    if (this.submissionClickListener) {
+      this.document.removeEventListener('click', this.submissionClickListener, true);
+      this.submissionClickListener = undefined;
+    }
+    this.submissionObserver?.disconnect();
+    this.submissionObserver = undefined;
   }
 
   async completeVideo(): Promise<void> {

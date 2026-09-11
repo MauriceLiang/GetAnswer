@@ -19,8 +19,12 @@ function isEditorErrorCode(value: unknown): value is Extract<
 export function fillCodeInPage(
   code: string,
   targetWindow: Window = window,
-  timeoutMs = DEFAULT_BRIDGE_TIMEOUT
+  timeoutMs = DEFAULT_BRIDGE_TIMEOUT,
+  signal?: AbortSignal
 ): Promise<void> {
+  if (signal?.aborted) {
+    return Promise.reject(appError('PLUGIN_DISABLED', '插件已关闭'));
+  }
   if (!code.trim()) {
     return Promise.reject(appError('EDITOR_WRITE_FAILED', '代码为空，无法写入编辑器'));
   }
@@ -31,7 +35,14 @@ export function fillCodeInPage(
 
     const cleanup = () => {
       targetWindow.removeEventListener('message', onMessage);
+      signal?.removeEventListener('abort', onAbort);
       if (timeout !== undefined) clearTimeout(timeout);
+    };
+
+    const onAbort = () => {
+      cleanup();
+      targetWindow.postMessage({ type: 'AI_CANCEL_CODE', requestId }, '*');
+      reject(appError('PLUGIN_DISABLED', '插件已关闭'));
     };
 
     const onMessage = (event: MessageEvent) => {
@@ -56,25 +67,41 @@ export function fillCodeInPage(
     };
 
     targetWindow.addEventListener('message', onMessage);
-    targetWindow.postMessage({ type: 'AI_FILL_CODE', code, requestId }, '*');
+    signal?.addEventListener('abort', onAbort, { once: true });
     timeout = setTimeout(() => {
       cleanup();
       reject(appError('EDITOR_WRITE_FAILED', '写入编辑器超时'));
     }, timeoutMs);
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+    targetWindow.postMessage({ type: 'AI_FILL_CODE', code, requestId }, '*');
   });
 }
 
 export function readCodeInPage(
   targetWindow: Window = window,
-  timeoutMs = DEFAULT_BRIDGE_TIMEOUT
+  timeoutMs = DEFAULT_BRIDGE_TIMEOUT,
+  signal?: AbortSignal
 ): Promise<string> {
+  if (signal?.aborted) {
+    return Promise.reject(appError('PLUGIN_DISABLED', '插件已关闭'));
+  }
   const requestId = nextRequestId();
   return new Promise<string>((resolve, reject) => {
     let timeout: ReturnType<typeof setTimeout> | undefined;
 
     const cleanup = () => {
       targetWindow.removeEventListener('message', onMessage);
+      signal?.removeEventListener('abort', onAbort);
       if (timeout !== undefined) clearTimeout(timeout);
+    };
+
+    const onAbort = () => {
+      cleanup();
+      targetWindow.postMessage({ type: 'AI_CANCEL_CODE', requestId }, '*');
+      reject(appError('PLUGIN_DISABLED', '插件已关闭'));
     };
 
     const onMessage = (event: MessageEvent) => {
@@ -99,10 +126,15 @@ export function readCodeInPage(
     };
 
     targetWindow.addEventListener('message', onMessage);
-    targetWindow.postMessage({ type: 'AI_READ_CODE', requestId }, '*');
+    signal?.addEventListener('abort', onAbort, { once: true });
     timeout = setTimeout(() => {
       cleanup();
       reject(appError('EDITOR_WRITE_FAILED', '读取编辑器超时'));
     }, timeoutMs);
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+    targetWindow.postMessage({ type: 'AI_READ_CODE', requestId }, '*');
   });
 }
