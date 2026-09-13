@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "AlphaCoding 考试切屏拦截",
+  "version": "0.1.0",
+  "description": "拦截 AlphaCoding 考试作答页的窗口失焦事件，保留输入框失焦行为。",
+  "minimum_chrome_version": "111",
+  "content_scripts": [
+    {
+      "matches": ["https://nuc.alphacoding.cn/exam/*"],
+      "js": ["guard.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ]
+}
